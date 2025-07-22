@@ -40,7 +40,8 @@ app.get('/hello', async (req, res) => {
     const result = await pool.query('SELECT COUNT(*) FROM visits');
     res.json({ message: 'Hello, World!', visitCount: result.rows[0].count });
   } catch (err) {
-    res.status(500).json({ error: 'Database error' });
+   
+    res.status(500).json({ error: 'Database error', message: err.message, full_error: err });
   }
 });
 
