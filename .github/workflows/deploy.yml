@@ -4,33 +4,24 @@ on:
   push:
     branches:
       - master
-  pull_request:
-    branches:
-      - master
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v3
+      - uses: actions/setup-node@v3
         with:
           node-version: '18'
 
-      - name: Install dependencies
-        run: npm install
+      - run: npm install
 
-      - name: Fix mocha permissions
-        run: chmod +x ./node_modules/.bin/mocha
+      - run: chmod +x ./node_modules/.bin/mocha
 
-      - name: Run tests
-        run: npm test
+      - run: npm test
 
-      - name: Upload test results
-        if: always()
+      - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results
@@ -41,52 +32,31 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v3
+      - uses: actions/setup-node@v3
         with:
           node-version: '18'
 
-      - name: Install dependencies
-        run: npm install
+      - run: npm install
 
-      - name: Build app
-        run: npm run build || true
+      - run: npm run build || true
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+      - uses: docker/setup-buildx-action@v2
 
-      - name: Configure Docker for insecure registry
+      - name: Push to Local Insecure Docker Registry
+        env:
+          REGISTRY_HOST: 37.27.196.138:5000
         run: |
-          # Ensure the Docker config directory exists
-          sudo mkdir -p /etc/docker
-          # Write insecure registry configuration
-          echo "{\"insecure-registries\": [\"${{ secrets.REGISTRY_HOST }}\"]}" | sudo tee /etc/docker/daemon.json
-          # Verify the configuration was written
-          cat /etc/docker/daemon.json
-          # Restart Docker daemon
-          sudo systemctl restart docker
-          # Wait for Docker to be ready
-          sleep 5
-          # Verify Docker is running
-          if ! sudo systemctl is-active --quiet docker; then
-            echo "Docker daemon failed to start" >&2
-            sudo systemctl status docker --no-pager
-            exit 1
-          fi
-          # Verify Buildx can connect to the registry
-          docker buildx ls
+          mkdir -p ~/.docker
+          echo '{ "insecure-registries": ["'"$REGISTRY_HOST"'"] }' > ~/.docker/daemon.json
+          echo '{ "auths": {}, "HttpHeaders": { "User-Agent": "Docker-Client/20.10.7 (linux)" } }' > ~/.docker/config.json
 
-      - name: Build and push Docker image to local registry
-        run: |
           docker buildx build \
-          --platform linux/amd64,linux/arm64 \
-          --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
-          -t ${{ secrets.REGISTRY_HOST }}/myapp:${{ github.sha }} \
-          --push \
-          .
+            --platform linux/amd64 \
+            --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
+            -t $REGISTRY_HOST/myapp:${{ github.sha }} \
+            --push .
 
       - name: SSH into VPS and deploy
         uses: appleboy/ssh-action@master
@@ -95,30 +65,21 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           password: ${{ secrets.VPS_PASSWORD }}
           script: |
-            # Configure Docker for insecure registry on VPS
-            echo "{\"insecure-registries\": [\"37.27.196.138:5000\"]}" | sudo tee /etc/docker/daemon.json
-            sudo systemctl restart docker
-            # Wait for Docker to be ready
-            sleep 5
-            # Verify Docker is running
-            if ! sudo systemctl is-active --quiet docker; then
-              echo "Docker daemon failed to start on VPS" >&2
-              sudo systemctl status docker --no-pager
-              exit 1
-            fi
-
-            # Set variables
             export APP_VERSION=${{ github.sha }}
             export APP_PORT=${{ secrets.APP_PORT }}
             export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
             export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            export REGISTRY_HOST=37.27.196.138:5000
 
-            # Create docker-compose.yml
+            echo '{ "insecure-registries": ["'$REGISTRY_HOST'"] }' | sudo tee /etc/docker/daemon.json
+            sudo systemctl restart docker
+            sleep 10
+
             cat << EOF > /root/docker-compose.yml
             version: '3.8'
             services:
               app:
-                image: 37.27.196.138:5000/myapp:\${APP_VERSION}
+                image: ${REGISTRY_HOST}/myapp:\${APP_VERSION}
                 ports:
                   - "\${APP_PORT}:3000"
                 environment:
@@ -144,30 +105,10 @@ jobs:
               postgres_data:
             EOF
 
-            # Pull new image
-            if ! docker pull 37.27.196.138:5000/myapp:\$APP_VERSION; then
-              echo "Failed to pull new image" >&2
-              exit 1
-            fi
-
-            # Stop and remove old containers
+            docker pull ${REGISTRY_HOST}/myapp:$APP_VERSION || exit 1
             docker compose -f /root/docker-compose.yml down || true
+            docker compose -f /root/docker-compose.yml up -d || exit 1
 
-            # Deploy new version
-            if ! docker compose -f /root/docker-compose.yml up -d; then
-              echo "Deployment failed, rolling back" >&2
-              if [ -n "${{ secrets.PREVIOUS_APP_VERSION }}" ]; then
-                export APP_VERSION=${{ secrets.PREVIOUS_APP_VERSION }}
-                docker compose -f /root/docker-compose.yml up -d
-                echo "Rolled back to \$APP_VERSION" >&2
-                exit 1
-              else
-                echo "No previous version for rollback" >&2
-                exit 1
-              fi
-            fi
+            docker images ${REGISTRY_HOST}/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -I {} docker rmi ${REGISTRY_HOST}/myapp:{} || true
 
-            # Clean up old images (keep last 5)
-            docker images 37.27.196.138:5000/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -I {} docker rmi 37.27.196.138:5000/myapp:{} || true
-
-            echo "\$APP_VERSION" > /root/previous_version.txt
+            echo "$APP_VERSION" > /root/previous_version.txt
