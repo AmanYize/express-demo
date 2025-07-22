@@ -34,7 +34,7 @@ jobs:
           name: test-results
           path: test-results/*.xml
 
-  build-and-deploy:
+  deploy:
     needs: test
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
@@ -42,64 +42,41 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Build app
-        run: npm run build || true
-
-      # This step configures the Docker daemon on the GitHub Actions runner
-      # to allow insecure HTTP communication with your registry.
-      # WARNING: This is a security risk and not recommended for production.
-      - name: Configure insecure Docker registry ⚠️
-        run: |
-          echo '{"insecure-registries": ["37.27.196.138:5000"]}' | sudo tee /etc/docker/daemon.json
-          sudo systemctl restart docker
-          echo "Docker daemon restarted. Verifying insecure registry setting:"
-          docker info | grep "Insecure Registries" # Verify the setting
-
-      - name: Build Docker image
-        run: |
-          docker build \
-            --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
-            -t 37.27.196.138:5000/myapp:${{ github.sha }} .
-
-      - name: Push Docker image to local registry
-        run: |
-          echo "Pushing image to 37.27.196.138:5000"
-          docker push 37.27.196.138:5000/myapp:${{ github.sha }}
-
-      - name: SSH into VPS and deploy
+      - name: SSH, Build, Push & Deploy on VPS
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           password: ${{ secrets.VPS_PASSWORD }}
           script: |
-            export APP_VERSION=${{ github.sha }}
-            export APP_PORT=${{ secrets.APP_PORT }}
-            export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
-            export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
-            export REGISTRY_HOST="37.27.196.138:5000" # Define registry host for docker-compose
+            cd /root/your-app-folder || mkdir -p /root/your-app-folder && cd /root/your-app-folder
 
-            echo "Using APP_VERSION=${APP_VERSION}"
-            echo "Using REGISTRY_HOST=${REGISTRY_HOST}"
+            # Copy app source code to VPS (optional: use git clone or rsync here if you want)
+            # For simplicity, you can do a git pull if repo exists
+            if [ -d ".git" ]; then
+              git reset --hard
+              git clean -fd
+              git pull origin master
+            else
+              git clone https://github.com/your-username/your-repo.git .
+            fi
 
-            # Create docker-compose.yml
+            # Build Docker image locally on VPS with GitHub SHA as tag
+            docker build -t 37.27.196.138:5000/myapp:${GITHUB_SHA} --build-arg NODE_VERSION=18 .
+
+            # Push image to local insecure registry on VPS
+            docker push 37.27.196.138:5000/myapp:${GITHUB_SHA}
+
+            # Create docker-compose.yml to deploy containers
             cat << EOF > /root/docker-compose.yml
             version: '3.8'
             services:
               app:
-                image: ${REGISTRY_HOST}/myapp:\${APP_VERSION}
+                image: 37.27.196.138:5000/myapp:${GITHUB_SHA}
                 ports:
-                  - "\${APP_PORT}:3000"
+                  - "${{ secrets.APP_PORT }}:3000"
                 environment:
-                  - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
+                  - POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
                 depends_on:
                   - postgres
                 restart: always
@@ -108,12 +85,12 @@ jobs:
                   interval: 30s
                   timeout: 3s
               postgres:
-                image: postgres:\${POSTGRES_VERSION}
+                image: postgres:${{ secrets.POSTGRES_VERSION }}
                 environment:
                   - POSTGRES_DB=mydb
-                  - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
+                  - POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
                 ports:
-                  - "5432:5432" # Changed from 5433:5432 in previous examples
+                  - "5433:5432"
                 restart: always
                 volumes:
                   - postgres_data:/var/lib/postgresql/data
@@ -121,26 +98,19 @@ jobs:
               postgres_data:
             EOF
 
-            echo "DEBUG: docker pull ${REGISTRY_HOST}/myapp:\${APP_VERSION}"
-            # Ensure the VPS Docker daemon also allows insecure registries if your registry is HTTP
-            # If your VPS is pulling from an insecure registry, you might need to configure its daemon.json too.
-            # This is beyond the scope of this workflow, but keep it in mind if pulls fail.
-            if ! docker pull ${REGISTRY_HOST}/myapp:${APP_VERSION}; then
-              echo "Failed to pull new image" >&2
-              exit 1
-            fi
+            # Pull image (should be local but let's ensure)
+            docker pull 37.27.196.138:5000/myapp:${GITHUB_SHA} || true
 
+            # Stop and remove old containers
             docker compose -f /root/docker-compose.yml down || true
 
+            # Deploy new version
             if ! docker compose -f /root/docker-compose.yml up -d; then
               echo "Deployment failed. Rolling back..." >&2
-              # Note: Rollback here uses a PREVIOUS_APP_VERSION secret.
-              # You need to ensure this secret is correctly managed (e.g., updated after a successful deploy).
-              # A more robust rollback might store history on the VPS.
-              if [ -n "${{ secrets.PREVIOUS_APP_VERSION }}" ]; then
-                export APP_VERSION=${{ secrets.PREVIOUS_APP_VERSION }}
-                docker compose -f /root/docker-compose.yml up -d
-                echo "Rolled back to \$APP_VERSION"
+              PREV_VERSION=$(cat /root/previous_version.txt || echo "")
+              if [ -n "$PREV_VERSION" ]; then
+                docker compose -f /root/docker-compose.yml up -d --no-deps -d 37.27.196.138:5000/myapp:$PREV_VERSION
+                echo "Rolled back to $PREV_VERSION"
                 exit 1
               else
                 echo "No previous version available for rollback" >&2
@@ -148,8 +118,8 @@ jobs:
               fi
             fi
 
-            # Clean up old images, keeping the latest 5 (current + 4 previous)
-            docker images ${REGISTRY_HOST}/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -I {} docker rmi ${REGISTRY_HOST}/myapp:{} || true
+            # Clean up old images (keep last 5)
+            docker images 37.27.196.138:5000/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi 37.27.196.138:5000/myapp:{} || true
 
-            # Store the current version for potential future rollbacks
-            echo "\$APP_VERSION" > /root/previous_version.txt
+            # Save current version for future rollback
+            echo "${GITHUB_SHA}" > /root/previous_version.txt
