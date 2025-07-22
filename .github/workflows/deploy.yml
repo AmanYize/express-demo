@@ -2,9 +2,11 @@ name: Build, Test, and Deploy Node.js Express Demo
 
 on:
   push:
-    branches: [ master ]
+    branches:
+      - master
   pull_request:
-    branches: [ master ]
+    branches:
+      - master
 
 jobs:
   test:
@@ -78,7 +80,6 @@ jobs:
 
             echo "Using APP_VERSION=${APP_VERSION}"
 
-            # Create docker-compose.yml
             cat << EOF > /root/docker-compose.yml
             version: '3.8'
             services:
@@ -109,8 +110,8 @@ jobs:
               postgres_data:
             EOF
 
-            echo "DEBUG: docker pull 37.27.196.138:5000/myapp:\${APP_VERSION}"
-            if ! docker pull 37.27.196.138:5000/myapp:${APP_VERSION}; then
+            echo "Pulling new image 37.27.196.138:5000/myapp:\${APP_VERSION}"
+            if ! docker pull 37.27.196.138:5000/myapp:\$APP_VERSION; then
               echo "Failed to pull new image" >&2
               exit 1
             fi
