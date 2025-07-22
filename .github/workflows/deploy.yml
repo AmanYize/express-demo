@@ -65,10 +65,7 @@ jobs:
           --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
           -t ${{ secrets.REGISTRY_HOST }}/myapp:${{ github.sha }} \
           --push \
-          --tls-verify=false \
           .
-
-
 
       - name: SSH into VPS and deploy
         uses: appleboy/ssh-action@master
