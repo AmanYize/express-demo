@@ -60,8 +60,12 @@ jobs:
 
       - name: Build and Push Docker Image to local registry
         run: |
-          docker build --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} -t 37.27.196.138:5000/myapp:${{ github.sha }} .
-          docker push 37.27.196.138:5000/myapp:${{ github.sha }}
+          docker buildx build \
+          --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
+          --push \
+          --platform linux/amd64,linux/arm64 \
+          --tls-verify=false \
+          -t 37.27.196.138:5000/myapp:${{ github.sha }} .
 
       - name: SSH into VPS and deploy
         uses: appleboy/ssh-action@master
