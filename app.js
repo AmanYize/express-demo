@@ -11,7 +11,7 @@ const pool = new Pool({
   host: 'postgres',    // <-- changed here
   database: 'mydb',
   password: process.env.POSTGRES_PASSWORD,
-  port: 5433,           // Docker postgres mapped port
+  port: 5432,           // Docker postgres mapped port
 });
 
 
