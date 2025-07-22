@@ -20,6 +20,8 @@ jobs:
           node-version: '18'
       - name: Install dependencies
         run: npm install
+      - name: Fix mocha permissions           # <== Add this step
+        run: chmod +x ./node_modules/.bin/mocha
       - name: Run tests
         run: npm test
       - name: Upload test results
