@@ -64,7 +64,8 @@ jobs:
       - name: Push Docker image
         env:
           DOCKER_TLS_VERIFY: "0"
-        run: docker push 37.27.196.138:5000/myapp:${{ github.sha }}
+        run: docker push ***:5000/myapp:${{ github.sha }}
+
 
 
       - name: SSH into VPS and deploy
