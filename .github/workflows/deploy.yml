@@ -76,15 +76,19 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           password: ${{ secrets.VPS_PASSWORD }}
           script: |
-            #!/bin/bash
-            set -e
+            # Set variables
+            export APP_VERSION=${{ github.sha }}
+            export APP_PORT=${{ secrets.APP_PORT }}
+            export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
+            export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            export REGISTRY_USER=${{ secrets.REGISTRY_USER }}
 
-            # Write docker-compose.yml on VPS, referencing Docker Hub image directly
+            # Create docker-compose.yml
             cat << EOF > /root/docker-compose.yml
             version: '3.8'
             services:
               app:
-                image: ${{ secrets.REGISTRY_USER }}/myapp:\${APP_VERSION}
+                image: ${REGISTRY_USER}/myapp:\${APP_VERSION}
                 ports:
                   - "\${APP_PORT}:3000"
                 environment:
@@ -110,14 +114,8 @@ jobs:
               postgres_data:
             EOF
 
-            # Export variables for compose
-            export APP_VERSION=${{ github.sha }}
-            export APP_PORT=${{ secrets.APP_PORT }}
-            export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
-            export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
-
-            # Pull the new image from Docker Hub
-            if ! docker pull ${{ secrets.REGISTRY_USER }}/myapp:\${APP_VERSION}; then
+            # Pull new image
+            if ! docker pull ${REGISTRY_USER}/myapp:$APP_VERSION; then
               echo "Failed to pull new image" >&2
               exit 1
             fi
@@ -125,13 +123,13 @@ jobs:
             # Stop and remove old containers
             docker compose -f /root/docker-compose.yml down || true
 
-            # Deploy new containers
+            # Deploy
             if ! docker compose -f /root/docker-compose.yml up -d; then
               echo "Deployment failed, rolling back" >&2
               if [ -n "${{ secrets.PREVIOUS_APP_VERSION }}" ]; then
                 export APP_VERSION=${{ secrets.PREVIOUS_APP_VERSION }}
                 docker compose -f /root/docker-compose.yml up -d
-                echo "Rolled back to \${APP_VERSION}" >&2
+                echo "Rolled back to $APP_VERSION" >&2
                 exit 1
               else
                 echo "No previous version for rollback" >&2
@@ -140,7 +138,6 @@ jobs:
             fi
 
             # Clean up old images (keep last 5)
-            docker images ${{ secrets.REGISTRY_USER }}/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -I {} docker rmi ${{ secrets.REGISTRY_USER }}/myapp:{} || true
+            docker images ${REGISTRY_USER}/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -I {} docker rmi ${REGISTRY_USER}/myapp:{} || true
 
-            # Update previous version
-            echo "${{ github.sha }}" > /root/previous_version.txt
+            echo "$APP_VERSION" > /root/previous_version.txt
