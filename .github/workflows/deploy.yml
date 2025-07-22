@@ -2,11 +2,9 @@ name: Build, Test, and Deploy Node.js Express Demo
 
 on:
   push:
-    branches:
-      - master
+    branches: [ master ]
   pull_request:
-    branches:
-      - master
+    branches: [ master ]
 
 jobs:
   test:
@@ -57,13 +55,13 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t 37.27.196.138:5000/myapp:${{ github.sha }} .
+          docker build \
+            --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
+            -t 37.27.196.138:5000/myapp:${{ github.sha }} .
 
-      - name: Push to local Docker registry
+      - name: Push Docker image to local registry
         run: |
-          echo '{ "insecure-registries": ["37.27.196.138:5000"] }' | sudo tee /etc/docker/daemon.json
-          sudo systemctl restart docker
-          sleep 10
+          echo "Pushing image to 37.27.196.138:5000"
           docker push 37.27.196.138:5000/myapp:${{ github.sha }}
 
       - name: SSH into VPS and deploy
@@ -73,15 +71,12 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           password: ${{ secrets.VPS_PASSWORD }}
           script: |
-            # Configure Docker for insecure registry on VPS
-            echo '{ "insecure-registries": ["37.27.196.138:5000"] }' | sudo tee /etc/docker/daemon.json
-            sudo systemctl restart docker
-            sleep 10
-
             export APP_VERSION=${{ github.sha }}
             export APP_PORT=${{ secrets.APP_PORT }}
             export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
             export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+
+            echo "Using APP_VERSION=${APP_VERSION}"
 
             # Create docker-compose.yml
             cat << EOF > /root/docker-compose.yml
@@ -114,30 +109,27 @@ jobs:
               postgres_data:
             EOF
 
-            # Pull new image
-            if ! docker pull 37.27.196.138:5000/myapp:\$APP_VERSION; then
+            echo "DEBUG: docker pull 37.27.196.138:5000/myapp:\${APP_VERSION}"
+            if ! docker pull 37.27.196.138:5000/myapp:${APP_VERSION}; then
               echo "Failed to pull new image" >&2
               exit 1
             fi
 
-            # Stop and remove old containers
             docker compose -f /root/docker-compose.yml down || true
 
-            # Deploy new version
             if ! docker compose -f /root/docker-compose.yml up -d; then
-              echo "Deployment failed, rolling back" >&2
+              echo "Deployment failed. Rolling back..." >&2
               if [ -n "${{ secrets.PREVIOUS_APP_VERSION }}" ]; then
                 export APP_VERSION=${{ secrets.PREVIOUS_APP_VERSION }}
                 docker compose -f /root/docker-compose.yml up -d
-                echo "Rolled back to \$APP_VERSION" >&2
+                echo "Rolled back to \$APP_VERSION"
                 exit 1
               else
-                echo "No previous version for rollback" >&2
+                echo "No previous version available for rollback" >&2
                 exit 1
               fi
             fi
 
-            # Clean up old images (keep last 5)
             docker images 37.27.196.138:5000/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -I {} docker rmi 37.27.196.138:5000/myapp:{} || true
 
             echo "\$APP_VERSION" > /root/previous_version.txt
