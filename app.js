@@ -8,7 +8,7 @@ const port = process.env.PORT || 3000;
 // PostgreSQL connection
 const pool = new Pool({
   user: 'postgres',
-  host: 'localhost',    // <-- changed here
+  host: 'postgres',    // <-- changed here
   database: 'mydb',
   password: process.env.POSTGRES_PASSWORD,
   port: 5433,           // Docker postgres mapped port
