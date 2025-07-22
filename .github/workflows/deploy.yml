@@ -58,14 +58,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      - name: Build Docker image
-        run: docker build --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} -t 37.27.196.138:5000/myapp:${{ github.sha }} .
-
-      - name: Push Docker image
-        env:
-          DOCKER_TLS_VERIFY: "0"
-        run: docker push ***:5000/myapp:${{ github.sha }}
-
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.REGISTRY_HOST }}/myapp:${{ github.sha }}
+          build-args: |
+            NODE_VERSION=${{ secrets.NODE_VERSION }}
 
 
       - name: SSH into VPS and deploy
