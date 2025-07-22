@@ -65,9 +65,16 @@ jobs:
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Build and Push Docker Image
-        run: |
-          docker build --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} -t ${{ secrets.REGISTRY_USER }}/myapp:${{ github.sha }} .
-          docker push ${{ secrets.REGISTRY_USER }}/myapp:${{ github.sha }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ secrets.REGISTRY_USER }}/myapp:${{ github.sha }}
+          build-args: |
+            NODE_VERSION=${{ secrets.NODE_VERSION }}
+
+
 
       - name: SSH into VPS and deploy
         uses: appleboy/ssh-action@master
