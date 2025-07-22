@@ -64,15 +64,19 @@ jobs:
           username: ${{ secrets.REGISTRY_USER }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: ${{ secrets.REGISTRY_USER }}/myapp:${{ github.sha }}
           build-args: |
             NODE_VERSION=${{ secrets.NODE_VERSION }}
+
 
 
 
