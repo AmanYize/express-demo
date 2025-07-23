@@ -55,15 +55,12 @@ jobs:
       - name: Build app
         run: npm run build || true
 
-      - name: Log in to Docker registry (skip TLS verify)
+      - name: Log in to Docker registry (insecure HTTP)
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          # Disable TLS verification temporarily to avoid cert issues
-          mkdir -p ~/.docker
-          echo '{"insecure-registries":["37.27.196.138:5000"]}' > ~/.docker/daemon.json
-          echo "$DOCKER_PASSWORD" | docker login 37.27.196.138:5000 -u "$DOCKER_USERNAME" --password-stdin --tls-verify=false
+          docker login 37.27.196.138:5000 -u "$DOCKER_USERNAME" --password-stdin <<< "$DOCKER_PASSWORD"
 
       - name: Build Docker image
         run: |
