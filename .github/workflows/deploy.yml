@@ -153,8 +153,8 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build app (if needed, e.g., for frontend assets)
-        run: npm run build || true # This step depends on your app's build process
+      - name: Set up Docker Buildx # NEW: For multi-platform builds
+        uses: docker/setup-buildx-action@v3
 
       - name: Configure Docker for insecure registry (on runner for build/push)
         run: |
@@ -175,22 +175,17 @@ jobs:
           done || { echo "Failed to log in to local registry on runner!"; exit 1; }
           echo "Logged into local registry."
 
-      - name: Build Docker image
-        # This builds the image using your Dockerfile located in the checked-out repo
+      - name: Build and Push Docker image to registry for multiple platforms # MODIFIED: Using Buildx
         run: |
-          LOCAL_REGISTRY_IMAGE="37.27.196.138:5000/myapp:${{ github.sha }}"
-          echo "Building Docker image: $LOCAL_REGISTRY_IMAGE"
-          docker build \
+          LOCAL_REGISTRY_IMAGE="37.27.196.138:5000/myapp"
+          APP_BUILD_TAG="${{ github.sha }}"
+          echo "Building and pushing multi-platform Docker image: ${LOCAL_REGISTRY_IMAGE}:${APP_BUILD_TAG}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64/v8 \
             --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
-            -t "$LOCAL_REGISTRY_IMAGE" . || { echo "Docker image build failed!"; exit 1; }
-          echo "Docker image built successfully."
-
-      - name: Push Docker image to registry
-        run: |
-          LOCAL_REGISTRY_IMAGE="37.27.196.138:5000/myapp:${{ github.sha }}"
-          echo "Pushing image $LOCAL_REGISTRY_IMAGE to local registry..."
-          docker push "$LOCAL_REGISTRY_IMAGE" || { echo "Docker image push failed!"; exit 1; }
-          echo "Image pushed successfully to local registry."
+            -t "${LOCAL_REGISTRY_IMAGE}:${APP_BUILD_TAG}" \
+            --push . || { echo "Multi-platform Docker image build and push failed!"; exit 1; }
+          echo "Multi-platform Docker image built and pushed successfully."
 
       - name: SSH into VPS and deploy application
         uses: appleboy/ssh-action@master
@@ -243,17 +238,45 @@ jobs:
             if [ -n "$LSOF_PIDS" ]; then
                 echo "Found processes on ports ${{ secrets.APP_PORT }} or 5433 (PIDs: $LSOF_PIDS). Attempting to kill them..."
                 sudo kill -9 $LSOF_PIDS || true # Force kill
-                sleep 15 # *** Increased sleep to ensure port release ***
+                sleep 5 # Initial small sleep
                 echo "Confirmed killed processes on ports ${{ secrets.APP_PORT }} or 5433."
             else
                 echo "No processes found holding ports ${{ secrets.APP_PORT }} or 5433."
             fi
             echo "--- Aggressive Application Cleanup Complete ---"
 
-            # *** Critical Delay to Allow Port Release ***
-            echo "Sleeping for 20 seconds to ensure ports are fully released before deployment..."
-            sleep 20
-            echo "Resuming deployment."
+            # --- Ensure Ports are Truly Free Before Deployment (Robust Check) ---
+            echo "Checking and waiting for ports ${{ secrets.APP_PORT }} and 5433 to be free..."
+            PORT_CHECK_COUNT=0
+            MAX_PORT_CHECKS=10 # Check up to 10 times
+            PORT_CHECK_INTERVAL=10 # Wait 10 seconds between checks
+
+            while [ "$PORT_CHECK_COUNT" -lt "$MAX_PORT_CHECKS" ]; do
+                # Check for any process holding either port
+                ACTIVE_PORTS=$(sudo lsof -i :${{ secrets.APP_PORT }} -i :5433 | grep LISTEN | awk '{print $1":"$9}' | xargs || true)
+
+                if [ -z "$ACTIVE_PORTS" ]; then
+                    echo "Ports ${{ secrets.APP_PORT }} and 5433 are free."
+                    break # Ports are free, exit loop
+                else
+                    echo "Ports still in use by: $ACTIVE_PORTS. Retrying in $PORT_CHECK_INTERVAL seconds..." >&2
+                    # Try to kill if it's docker-proxy or any related lingering process
+                    LSOF_PIDS=$(sudo lsof -t -i :${{ secrets.APP_PORT }} -i :5433 || true)
+                    if [ -n "$LSOF_PIDS" ]; then
+                        echo "Attempting to kill processes: $LSOF_PIDS" >&2
+                        sudo kill -9 $LSOF_PIDS || true
+                    fi
+                    sleep "$PORT_CHECK_INTERVAL"
+                    PORT_CHECK_COUNT=$((PORT_CHECK_COUNT + 1))
+                fi
+            done
+
+            if [ "$PORT_CHECK_COUNT" -eq "$MAX_PORT_CHECKS" ]; then
+                echo "ERROR: Ports ${{ secrets.APP_PORT }} or 5433 are still in use after multiple checks. Aborting deployment." >&2
+                exit 1
+            fi
+            echo "Ports are confirmed free. Resuming deployment."
+            # --- End Port Check ---
 
             # Clone or update repository to ensure the latest docker-compose.yml is present
             echo "Updating application repository..."
