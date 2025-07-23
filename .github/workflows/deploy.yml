@@ -60,17 +60,16 @@ jobs:
             # Clean up old registry containers (if any)
             docker ps -a | grep registry | awk '{print $1}' | xargs -r docker rm -f || true
 
-            # Clone or update repository
-            cd /root/your-app-folder || mkdir -p /root/your-app-folder && cd /root/your-app-folder
-            if [ -d ".git" ]; then
-              git reset --hard
-              git clean -fd
-              git pull origin master
-            else
-              git clone https://github.com/${{ github.repository }} .
+            # Clone or update repository and navigate into the app directory
+            if [ ! -d "/root/express-demo" ]; then
+              git clone https://github.com/${{ github.repository }} /root/express-demo
             fi
+            cd /root/express-demo
+            git reset --hard
+            git clean -fd
+            git pull origin master
 
-            # Build Docker image with retries
+            # Build Docker image with retries, referencing the Dockerfile in the current directory
             for attempt in {1..3}; do
               docker build \
                 --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
@@ -83,10 +82,10 @@ jobs:
             sudo ufw allow ${{ secrets.APP_PORT }}
             sudo ufw allow 5433
 
-            # Stop and remove old containers
+            # Stop and remove old containers using the docker-compose.yml in the current directory
             docker compose -f docker-compose.yml down || true
 
-            # Deploy new version with retries
+            # Deploy new version with retries using the docker-compose.yml in the current directory
             export APP_VERSION=${{ github.sha }}
             export APP_PORT=${{ secrets.APP_PORT }}
             export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
