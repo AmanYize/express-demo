@@ -55,23 +55,26 @@ jobs:
       - name: Build app
         run: npm run build || true
 
-      - name: Log in to Docker registry
+      - name: Log in to Docker registry (skip TLS verify)
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          echo "$DOCKER_PASSWORD" | docker login 37.27.196.138 -u "$DOCKER_USERNAME" --password-stdin
+          # Disable TLS verification temporarily to avoid cert issues
+          mkdir -p ~/.docker
+          echo '{"insecure-registries":["37.27.196.138:5000"]}' > ~/.docker/daemon.json
+          echo "$DOCKER_PASSWORD" | docker login 37.27.196.138:5000 -u "$DOCKER_USERNAME" --password-stdin --tls-verify=false
 
       - name: Build Docker image
         run: |
           docker build \
             --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
-            -t 37.27.196.138/myapp:${{ github.sha }} .
+            -t 37.27.196.138:5000/myapp:${{ github.sha }} .
 
-      - name: Push Docker image to registry
+      - name: Push Docker image to registry (skip TLS verify)
         run: |
-          echo "Pushing image to 37.27.196.138"
-          docker push 37.27.196.138/myapp:${{ github.sha }}
+          echo "Pushing image to 37.27.196.138:5000"
+          docker push 37.27.196.138:5000/myapp:${{ github.sha }} --tls-verify=false
 
       - name: SSH into VPS and deploy
         uses: appleboy/ssh-action@master
@@ -91,7 +94,7 @@ jobs:
             version: '3.8'
             services:
               app:
-                image: 37.27.196.138/myapp:\${APP_VERSION}
+                image: 37.27.196.138:5000/myapp:\${APP_VERSION}
                 ports:
                   - "\${APP_PORT}:3000"
                 environment:
@@ -117,8 +120,8 @@ jobs:
               postgres_data:
             EOF
 
-            echo "Pulling new image 37.27.196.138/myapp:\${APP_VERSION}"
-            if ! docker pull 37.27.196.138/myapp:\$APP_VERSION; then
+            echo "Pulling new image 37.27.196.138:5000/myapp:\${APP_VERSION}"
+            if ! docker pull 37.27.196.138:5000/myapp:\$APP_VERSION; then
               echo "Failed to pull new image" >&2
               exit 1
             fi
@@ -138,6 +141,6 @@ jobs:
               fi
             fi
 
-            docker images 37.27.196.138/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -I {} docker rmi 37.27.196.138/myapp:{} || true
+            docker images 37.27.196.138:5000/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -I {} docker rmi 37.27.196.138:5000/myapp:{} || true
 
             echo "\$APP_VERSION" > /root/previous_version.txt
