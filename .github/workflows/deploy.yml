@@ -57,7 +57,7 @@ jobs:
 
             # Configure insecure registry (using your provided IP)
             # This is crucial for Docker to allow pushing/pulling from your local registry
-            echo '{"insecure-registries": ["37.27.196.198:5000"]}' | sudo tee /etc/docker/daemon.json # Updated IP
+            echo '{"insecure-registries": ["37.27.196.198:5000"]}' | sudo tee /etc/docker/daemon.json
             sudo systemctl restart docker
             echo "Docker daemon configured for insecure registry and restarted."
 
@@ -65,7 +65,7 @@ jobs:
             REGISTRY_DIR="/root/registry"
             REGISTRY_COMPOSE_FILE="$REGISTRY_DIR/docker-compose.yml"
             REGISTRY_AUTH_DIR="$REGISTRY_DIR/auth"
-            REGISTRY_IP="37.27.196.198" # Updated IP
+            REGISTRY_IP="37.27.196.198" # Your VPS public IP for registry
 
             # Ensure registry directory and auth directory exist
             mkdir -p "$REGISTRY_AUTH_DIR"
@@ -156,26 +156,27 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # NEW STEP: Configure Buildx builder to allow insecure registries
-      - name: Configure Buildx for Insecure Registry
+      # --- Start Buildx Stability Fixes ---
+      - name: Clean up existing Buildx builders (important for fresh state)
+        run: docker buildx rm mybuilder || true # Remove the specific builder if it exists, ignore errors
+
+      - name: Configure Buildx for Insecure Registry and Bootstrap
         run: |
           BUILDER_NAME="mybuilder"
           REGISTRY_IP="37.27.196.198" # Ensure this matches your registry's IP
 
-          # Check if the builder exists and if it supports insecure registries
-          # If it doesn't exist or isn't configured, create/recreate it
-          if ! docker buildx inspect $BUILDER_NAME &>/dev/null || ! docker buildx inspect $BUILDER_NAME | grep -q "insecure-registry.*${REGISTRY_IP}:5000"; then
-            echo "Creating/reconfiguring Buildx builder '$BUILDER_NAME' with insecure registry support..."
-            # Use --append if you want to add to an existing builder, or just create/recreate
-            docker buildx create --name $BUILDER_NAME --use --driver docker-container --buildkitd-flags "--allow-insecure-entitlement"
-            docker buildx inspect --bootstrap # Ensures the builder is running
-          else
-            echo "Buildx builder '$BUILDER_NAME' already configured for insecure registry."
-          fi
+          echo "Creating/reconfiguring Buildx builder '$BUILDER_NAME' with insecure registry support..."
+          docker buildx create --name $BUILDER_NAME --use --driver docker-container --buildkitd-flags "--allow-insecure-entitlement"
+          echo "Bootstrapping Buildx builder..."
+          docker buildx inspect --bootstrap # Ensures the builder is running and ready
+
+          echo "Giving Buildx builder a moment to stabilize..."
+          sleep 10 # Added delay to allow buildkitd to fully start and stabilize
+      # --- End Buildx Stability Fixes ---
 
       - name: Configure Docker for insecure registry (on runner for build/push)
         run: |
-          echo '{"insecure-registries": ["37.27.196.198:5000"]}' | sudo tee /etc/docker/daemon.json # Updated IP
+          echo '{"insecure-registries": ["37.27.196.198:5000"]}' | sudo tee /etc/docker/daemon.json
           sudo systemctl restart docker
           echo "Runner's Docker daemon configured for insecure registry."
 
@@ -184,9 +185,9 @@ jobs:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          echo "Logging into local registry 37.27.196.198:5000..." # Updated IP
+          echo "Logging into local registry 37.27.196.198:5000..."
           for attempt in {1..3}; do
-            echo "$DOCKER_PASSWORD" | docker login 37.27.196.198:5000 -u "$DOCKER_USERNAME" --password-stdin && break # Updated IP
+            echo "$DOCKER_PASSWORD" | docker login 37.27.196.198:5000 -u "$DOCKER_USERNAME" --password-stdin && break
             echo "Login attempt $attempt failed, retrying..." >&2
             sleep 5
           done || { echo "Failed to log in to local registry on runner!"; exit 1; }
@@ -194,14 +195,14 @@ jobs:
 
       - name: Build and Push Docker image to registry for multiple platforms
         run: |
-          LOCAL_REGISTRY_IMAGE="37.27.196.198:5000/myapp" # Updated IP
+          LOCAL_REGISTRY_IMAGE="37.27.196.198:5000/myapp"
           APP_BUILD_TAG="${{ github.sha }}"
           echo "Building and pushing multi-platform Docker image: ${LOCAL_REGISTRY_IMAGE}:${APP_BUILD_TAG}"
           docker buildx build \
             --platform linux/amd64,linux/arm64/v8 \
             --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
             -t "${LOCAL_REGISTRY_IMAGE}:${APP_BUILD_TAG}" \
-            --push . || { echo "Multi-platform Docker image build and push failed!"; exit 1; } # Removed --allow-insecure-entitlement from here
+            --push . || { echo "Multi-platform Docker image build and push failed!"; exit 1; }
           echo "Multi-platform Docker image built and pushed successfully."
 
       - name: SSH into VPS and deploy application
@@ -234,7 +235,7 @@ jobs:
             # Force stop/remove any remaining containers related to app or postgres images
             echo "Force stopping and removing any lingering app or postgres containers..."
             # Get IDs of containers derived from your app image or postgres image
-            OLD_APP_CONTAINERS=$(docker ps -a -q --filter "ancestor=37.27.196.198:5000/myapp" || true) # Updated IP
+            OLD_APP_CONTAINERS=$(docker ps -a -q --filter "ancestor=37.27.196.198:5000/myapp" || true)
             OLD_POSTGRES_CONTAINERS=$(docker ps -a -q --filter "ancestor=postgres" || true)
 
             if [ -n "$OLD_APP_CONTAINERS" ]; then
@@ -308,7 +309,7 @@ jobs:
 
             # Log in to local registry on VPS (for pulling app image)
             echo "Logging into local registry on VPS..."
-            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.198:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin || { echo "Docker login on VPS failed!"; exit 1; } # Updated IP
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.198:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin || { echo "Docker login on VPS failed!"; exit 1; }
             echo "Logged into local registry on VPS."
 
             # Export environment variables for docker-compose to use (APP_VERSION, APP_PORT, POSTGRES_*)
@@ -342,7 +343,7 @@ jobs:
               PREV_VERSION=$(cat /root/previous_version.txt || echo "")
               if [ -n "$PREV_VERSION" ]; then
                 export APP_VERSION="$PREV_VERSION" # Set APP_VERSION for rollback
-                echo "Attempting to pull and roll back to 37.27.196.198:5000/myapp:$PREV_VERSION from local registry" # Updated IP
+                echo "Attempting to pull and roll back to 37.27.196.198:5000/myapp:$PREV_VERSION from local registry"
                 # Ensure we are in the app directory for rollback compose commands
                 cd "$APP_DIR"
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml pull app || { echo "Failed to pull previous app image for rollback!"; exit 1; }
@@ -359,7 +360,7 @@ jobs:
             # Post-Deployment Cleanup
             echo "--- Starting Post-Deployment Cleanup ---"
             # Clean up old images (keep last 5). Use the full local registry image name.
-            APP_IMAGE_FULL_NAME="37.27.196.198:5000/myapp" # Updated IP
+            APP_IMAGE_FULL_NAME="37.27.196.198:5000/myapp"
             docker images "$APP_IMAGE_FULL_NAME" --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi "$APP_IMAGE_FULL_NAME":{} || true
             echo "Old Docker application images cleaned up."
 
