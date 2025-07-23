@@ -55,9 +55,8 @@ jobs:
             sudo systemctl enable docker
             sudo systemctl start docker
 
-            # Configure insecure registry (using your provided IP)
-            # This is crucial for Docker to allow pushing/pulling from your local registry
-            echo '{"insecure-registries": ["37.27.196.198:5000"]}' | sudo tee /etc/docker/daemon.json
+            # Configure insecure registry
+            echo '{"insecure-registries": ["37.27.196.138:5000"]}' | sudo tee /etc/docker/daemon.json # **Updated IP**
             sudo systemctl restart docker
             echo "Docker daemon configured for insecure registry and restarted."
 
@@ -65,7 +64,7 @@ jobs:
             REGISTRY_DIR="/root/registry"
             REGISTRY_COMPOSE_FILE="$REGISTRY_DIR/docker-compose.yml"
             REGISTRY_AUTH_DIR="$REGISTRY_DIR/auth"
-            REGISTRY_IP="37.27.196.198" # Your VPS public IP for registry
+            REGISTRY_IP="37.27.196.138" # **Updated IP**
 
             # Ensure registry directory and auth directory exist
             mkdir -p "$REGISTRY_AUTH_DIR"
@@ -94,7 +93,6 @@ jobs:
             echo "Registry docker-compose.yml created."
 
             # Create htpasswd for registry authentication
-            # Using secrets for username/password
             docker run --entrypoint htpasswd httpd:2 -Bbn "${{ secrets.DOCKER_USERNAME }}" "${{ secrets.DOCKER_PASSWORD }}" > "$REGISTRY_AUTH_DIR/htpasswd"
             echo "htpasswd file created for registry authentication."
 
@@ -106,24 +104,22 @@ jobs:
             echo "Starting registry..."
             for attempt in {1..3}; do
               docker compose -f "$REGISTRY_COMPOSE_FILE" up -d
-              # Check if container is running after up command
               if docker ps --filter "ancestor=registry:2" --filter "status=running" | grep -q "registry"; then
                 echo "Registry container appears to be running."
                 break
               else
                 echo "Registry container not running after 'up' command. Checking logs for details..." >&2
-                docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true # Show logs of the latest registry container
+                docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true
               fi
               echo "Registry start attempt $attempt failed, retrying..." >&2
               sleep 5
             done || { echo "Registry failed to start after multiple attempts!"; exit 1; }
             echo "Registry started successfully."
 
-            # Verify registry is running and accessible (using localhost for internal check and authentication)
+            # Verify registry is running and accessible
             echo "Verifying registry health using localhost:5000 with authentication..."
             if ! curl -s -u "${{ secrets.DOCKER_USERNAME }}:${{ secrets.DOCKER_PASSWORD }}" http://localhost:5000/v2/ | grep -q '{}'; then
               echo "Registry failed health check on HTTP at localhost:5000" >&2
-              # Add more debug info if health check fails
               echo "Current docker ps output:" >&2
               docker ps -a >&2
               echo "Current docker logs for registry:" >&2
@@ -145,13 +141,8 @@ jobs:
       - name: Checkout code (on GitHub Actions Runner)
         uses: actions/checkout@v3
 
-      # Removed all Node.js setup and dependency installation steps here
-      # as we will do that on the VPS directly before building the image.
-      # Removed all Docker Buildx specific steps.
-
-      # The Docker login and insecure-registries config are now only needed on the VPS
-      # if you intend to push the image to your private registry from the VPS after building.
-      # It's generally good practice to do so for image management.
+      # All Docker build and push operations for the app image are now done on the VPS.
+      # Docker login is also handled on the VPS directly.
 
       - name: SSH into VPS, Build, and Deploy application
         uses: appleboy/ssh-action@master
@@ -161,74 +152,66 @@ jobs:
           password: ${{ secrets.VPS_PASSWORD }}
           script: |
             echo "--- Starting Application Deployment on VPS ---"
-            APP_DIR="/root/express-demo" # Consistent application directory
-            PROJECT_NAME="express-demo" # Docker Compose project name
-            LOCAL_REGISTRY_IMAGE="37.27.196.198:5000/myapp" # Your registry image name
-            APP_BUILD_TAG="${{ github.sha }}" # Tag for the image
+            APP_DIR="/root/express-demo"
+            PROJECT_NAME="express-demo"
+            LOCAL_REGISTRY_IMAGE="37.27.196.138:5000/myapp" # **Updated IP**
+            APP_BUILD_TAG="${{ github.sha }}"
 
             # 1. Aggressive Cleanup of application-related containers and processes
             echo "--- Starting Aggressive Application Cleanup ---"
-            cd /root # Ensure we are not inside the app directory for initial broad commands
+            cd /root
 
-            # Stop and remove containers by project name (most common for compose)
             echo "Attempting docker compose down for project: $PROJECT_NAME..."
             if [ -d "$APP_DIR" ] && [ -f "$APP_DIR/docker-compose.yml" ]; then
                 cd "$APP_DIR"
-                # Use --timeout 0 for immediate stop, --rmi all to remove images, --volumes to remove named volumes
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml down --timeout 0 --rmi all --volumes --remove-orphans || true
                 echo "docker compose down completed for $PROJECT_NAME."
-                cd /root # Change back to root after docker compose down
+                cd /root
             else
                 echo "App directory or docker-compose.yml not found, skipping docker compose down."
             fi
 
-            # Force stop/remove any remaining containers related to app or postgres images
             echo "Force stopping and removing any lingering app or postgres containers..."
-            # Get IDs of containers derived from your app image or postgres image
-            OLD_APP_CONTAINERS=$(docker ps -a -q --filter "ancestor=${LOCAL_REGISTRY_IMAGE}" || true) # Use the full image name
+            OLD_APP_CONTAINERS=$(docker ps -a -q --filter "ancestor=${LOCAL_REGISTRY_IMAGE}" || true)
             OLD_POSTGRES_CONTAINERS=$(docker ps -a -q --filter "ancestor=postgres" || true)
 
             if [ -n "$OLD_APP_CONTAINERS" ]; then
                 echo "Stopping and removing old app containers: $OLD_APP_CONTAINERS"
                 docker stop $OLD_APP_CONTAINERS || true
-                docker rm -f $OLD_APP_CONTAINERS || true # Use -f for force removal
+                docker rm -f $OLD_APP_CONTAINERS || true
             fi
             if [ -n "$OLD_POSTGRES_CONTAINERS" ]; then
                 echo "Stopping and removing old postgres containers: $OLD_POSTGRES_CONTAINERS"
                 docker stop $OLD_POSTGRES_CONTAINERS || true
-                docker rm -f $OLD_POSTGRES_CONTAINERS || true # Use -f for force removal
+                docker rm -f $OLD_POSTGRES_CONTAINERS || true
             fi
 
-            # Aggressively kill any process holding the ports (last resort and primary fix for stubborn issues)
             echo "Checking and attempting to kill any process still holding ports ${{ secrets.APP_PORT }} or 5433..."
             LSOF_PIDS=$(sudo lsof -t -i :${{ secrets.APP_PORT }} -i :5433 | grep -v "^$" || true)
 
             if [ -n "$LSOF_PIDS" ]; then
                 echo "Found processes on ports ${{ secrets.APP_PORT }} or 5433 (PIDs: $LSOF_PIDS). Attempting to kill them..."
-                sudo kill -9 $LSOF_PIDS || true # Force kill
-                sleep 5 # Initial small sleep
+                sudo kill -9 $LSOF_PIDS || true
+                sleep 5
                 echo "Confirmed killed processes on ports ${{ secrets.APP_PORT }} or 5433."
             else
                 echo "No processes found holding ports ${{ secrets.APP_PORT }} or 5433."
             fi
             echo "--- Aggressive Application Cleanup Complete ---"
 
-            # --- Ensure Ports are Truly Free Before Deployment (Robust Check) ---
             echo "Checking and waiting for ports ${{ secrets.APP_PORT }} and 5433 to be free..."
             PORT_CHECK_COUNT=0
-            MAX_PORT_CHECKS=10 # Check up to 10 times
-            PORT_CHECK_INTERVAL=10 # Wait 10 seconds between checks
+            MAX_PORT_CHECKS=10
+            PORT_CHECK_INTERVAL=10
 
             while [ "$PORT_CHECK_COUNT" -lt "$MAX_PORT_CHECKS" ]; do
-                # Check for any process holding either port
                 ACTIVE_PORTS=$(sudo lsof -i :${{ secrets.APP_PORT }} -i :5433 | grep LISTEN | awk '{print $1":"$9}' | xargs || true)
 
                 if [ -z "$ACTIVE_PORTS" ]; then
                     echo "Ports ${{ secrets.APP_PORT }} and 5433 are free."
-                    break # Ports are free, exit loop
+                    break
                 else
                     echo "Ports still in use by: $ACTIVE_PORTS. Retrying in $PORT_CHECK_INTERVAL seconds..." >&2
-                    # Try to kill if it's docker-proxy or any related lingering process
                     LSOF_PIDS=$(sudo lsof -t -i :${{ secrets.APP_PORT }} -i :5433 || true)
                     if [ -n "$LSOF_PIDS" ]; then
                         echo "Attempting to kill processes: $LSOF_PIDS" >&2
@@ -244,7 +227,6 @@ jobs:
                 exit 1
             fi
             echo "Ports are confirmed free. Resuming deployment."
-            # --- End Port Check ---
 
             # Clone or update repository to ensure the latest code and docker-compose.yml are present
             echo "Updating application repository on VPS..."
@@ -259,12 +241,11 @@ jobs:
 
             # Log in to local registry on VPS (for pushing the newly built app image)
             echo "Logging into local registry on VPS for push..."
-            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.198:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin || { echo "Docker login on VPS failed!"; exit 1; }
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.138:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin || { echo "Docker login on VPS failed!"; exit 1; } # **Updated IP**
             echo "Logged into local registry on VPS."
 
             # Build the Docker image natively on the VPS
             echo "Building Docker image natively on VPS..."
-            # Ensure NODE_VERSION is available as a build arg if your Dockerfile uses it
             docker build \
               --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
               -t "${LOCAL_REGISTRY_IMAGE}:${APP_BUILD_TAG}" \
@@ -293,7 +274,6 @@ jobs:
             # Deploy new version with retries
             echo "Deploying new application version with docker-compose..."
             for attempt in {1..3}; do
-              # Ensure we're in the right directory for docker compose
               cd "$APP_DIR"
               docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d && break
               echo "Deployment attempt $attempt failed, retrying..." >&2
@@ -303,19 +283,18 @@ jobs:
 
             # Verification and Rollback
             echo "--- Starting Application Verification ---"
-            sleep 10 # Give app time to start
+            sleep 10
             if ! curl -s http://localhost:${{ secrets.APP_PORT }}/health | grep -q "ok"; then
               echo "Deployment failed health check. Rolling back..." >&2
               PREV_VERSION=$(cat /root/previous_version.txt || echo "")
               if [ -n "$PREV_VERSION" ]; then
-                export APP_VERSION="$PREV_VERSION" # Set APP_VERSION for rollback
+                export APP_VERSION="$PREV_VERSION"
                 echo "Attempting to pull and roll back to ${LOCAL_REGISTRY_IMAGE}:$PREV_VERSION from local registry"
-                # Ensure we are in the app directory for rollback compose commands
                 cd "$APP_DIR"
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml pull app || { echo "Failed to pull previous app image for rollback!"; exit 1; }
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d || { echo "Failed to deploy previous version during rollback!"; exit 1; }
                 echo "Rolled back to $PREV_VERSION"
-                exit 1 # Exit with error code to indicate rollback happened
+                exit 1
               else
                 echo "No previous version available for rollback. Manual intervention required." >&2
                 exit 1
@@ -325,11 +304,9 @@ jobs:
 
             # Post-Deployment Cleanup
             echo "--- Starting Post-Deployment Cleanup ---"
-            # Clean up old images (keep last 5). Use the full local registry image name.
             docker images "${LOCAL_REGISTRY_IMAGE}" --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi "${LOCAL_REGISTRY_IMAGE}":{} || true
             echo "Old Docker application images cleaned up."
 
-            # Save current version for future rollback
             echo "${{ github.sha }}" > /root/previous_version.txt
             echo "Current version (${{ github.sha }}) saved for future rollback."
             echo "--- Post-Deployment Cleanup Complete ---"
