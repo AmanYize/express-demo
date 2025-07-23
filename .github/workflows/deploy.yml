@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # This job runs on the default AMD64 runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -36,7 +36,7 @@ jobs:
 
   deploy-registry:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # This job runs on the default AMD64 runner
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - name: SSH into VPS and deploy registry
@@ -47,23 +47,29 @@ jobs:
           password: ${{ secrets.VPS_PASSWORD }}
           script: |
             echo "--- Starting Registry Deployment Setup ---"
+            # Ensure necessary tools are installed
             sudo apt update
-            sudo apt install -y curl git docker.io docker-compose
+            sudo apt install -y curl git docker.io docker-compose net-tools lsof
 
+            # Enable and start Docker
             sudo systemctl enable docker
             sudo systemctl start docker
 
+            # Configure insecure registry
             echo '{"insecure-registries": ["37.27.196.138:5000"]}' | sudo tee /etc/docker/daemon.json
             sudo systemctl restart docker
             echo "Docker daemon configured for insecure registry and restarted."
 
+            # Define registry path
             REGISTRY_DIR="/root/registry"
             REGISTRY_COMPOSE_FILE="$REGISTRY_DIR/docker-compose.yml"
             REGISTRY_AUTH_DIR="$REGISTRY_DIR/auth"
             REGISTRY_IP="37.27.196.138"
 
+            # Ensure registry directory and auth directory exist
             mkdir -p "$REGISTRY_AUTH_DIR"
 
+            # Generate registry docker-compose.yml
             cat << EOF > "$REGISTRY_COMPOSE_FILE"
             version: '3.8'
             services:
@@ -86,9 +92,11 @@ jobs:
             EOF
             echo "Registry docker-compose.yml created."
 
+            # Create htpasswd for registry authentication
             docker run --entrypoint htpasswd httpd:2 -Bbn "${{ secrets.DOCKER_USERNAME }}" "${{ secrets.DOCKER_PASSWORD }}" > "$REGISTRY_AUTH_DIR/htpasswd"
             echo "htpasswd file created for registry authentication."
 
+            # Stop and remove old registry containers before starting a new one
             docker compose -f "$REGISTRY_COMPOSE_FILE" down || true
             echo "Previous registry containers stopped and removed."
 
@@ -143,6 +151,9 @@ jobs:
             LOCAL_REGISTRY_IMAGE="37.27.196.138:5000/myapp"
             APP_BUILD_TAG="${{ github.sha }}"
 
+            # Ensure necessary tools are installed for robust port checking
+            sudo apt update && sudo apt install -y net-tools lsof || true # `|| true` to prevent failure if already installed
+
             # 1. Aggressive Cleanup of application-related containers and processes
             echo "--- Starting Aggressive Application Cleanup ---"
             cd /root
@@ -150,8 +161,6 @@ jobs:
             echo "Attempting docker compose down for project: $PROJECT_NAME..."
             if [ -d "$APP_DIR" ] && [ -f "$APP_DIR/docker-compose.yml" ]; then
                 cd "$APP_DIR"
-                # Use --timeout 0 for immediate stop, --rmi all to remove images, --volumes to remove named volumes
-                # Added --volumes --rmi all to be more aggressive
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml down --timeout 0 --rmi all --volumes --remove-orphans || true
                 echo "docker compose down completed for $PROJECT_NAME."
                 cd /root
@@ -174,63 +183,44 @@ jobs:
                 docker rm -f $OLD_POSTGRES_CONTAINERS || true
             fi
 
-            # New: More targeted killing of docker-proxy for the specific port
-            echo "Checking and attempting to kill any docker-proxy processes holding ports ${{ secrets.APP_PORT }} or 5433..."
-            # Find PIDs associated with docker-proxy using these ports
-            DOCKER_PROXY_PIDS=$(sudo netstat -tulnp | grep -E ":(${APP_PORT}|5433)\>" | grep "docker-proxy" | awk '{print $NF}' | cut -d'/' -f1 | xargs || true)
-            
-            if [ -n "$DOCKER_PROXY_PIDS" ]; then
-                echo "Found docker-proxy processes on ports ${{ secrets.APP_PORT }} or 5433 (PIDs: $DOCKER_PROXY_PIDS). Attempting to kill them..."
-                sudo kill -9 $DOCKER_PROXY_PIDS || true # Force kill
-                sleep 2 # Give a moment for the OS to release the port
-                echo "Confirmed killed docker-proxy processes."
-            else
-                echo "No docker-proxy processes found holding ports ${{ secrets.APP_PORT }} or 5433."
-            fi
+            # --- Advanced Port Cleanup Loop ---
+            echo "--- Starting Advanced Port Cleanup and Verification for ports ${{ secrets.APP_PORT }} and 5433 ---"
+            PORT_CLEANUP_ATTEMPTS=0
+            MAX_PORT_CLEANUP_ATTEMPTS=20 # Increased attempts
+            PORT_CHECK_INTERVAL=3 # Reduced interval for faster checks
 
-            # Original: Aggressively kill any process holding the ports (broader check after docker-proxy)
-            echo "Re-checking and attempting to kill any remaining process still holding ports ${{ secrets.APP_PORT }} or 5433..."
-            LSOF_PIDS=$(sudo lsof -t -i :${{ secrets.APP_PORT }} -i :5433 | grep -v "^$" || true)
+            while [ "$PORT_CLEANUP_ATTEMPTS" -lt "$MAX_PORT_CLEANUP_ATTEMPTS" ]; do
+                echo "Attempt $((PORT_CLEANUP_ATTEMPTS + 1)) of $MAX_PORT_CLEANUP_ATTEMPTS: Checking ports ${{ secrets.APP_PORT }} and 5433."
+                
+                # Find processes holding the ports using netstat (often good for docker-proxy)
+                NETSTAT_PIDS=$(sudo netstat -tulnp | grep -E ":(${APP_PORT}|5433)\>" | awk '{print $NF}' | cut -d'/' -f1 | xargs || true)
+                
+                # Find processes holding the ports using lsof (more general)
+                LSOF_PIDS=$(sudo lsof -t -i :${{ secrets.APP_PORT }} -i :5433 | grep -v "^$" | xargs || true) # Get PIDs, filter empty lines
 
-            if [ -n "$LSOF_PIDS" ]; then
-                echo "Found processes on ports ${{ secrets.APP_PORT }} or 5433 (PIDs: $LSOF_PIDS). Attempting to kill them..."
-                sudo kill -9 $LSOF_PIDS || true
-                sleep 5
-                echo "Confirmed killed processes on ports ${{ secrets.APP_PORT }} or 5433."
-            else
-                echo "No remaining processes found holding ports ${{ secrets.APP_PORT }} or 5433."
-            fi
-            echo "--- Aggressive Application Cleanup Complete ---"
+                ALL_PIDS=$(echo "$NETSTAT_PIDS $LSOF_PIDS" | tr ' ' '\n' | sort -u | xargs || true) # Combine and get unique PIDs
 
-            echo "Checking and waiting for ports ${{ secrets.APP_PORT }} and 5433 to be free..."
-            PORT_CHECK_COUNT=0
-            MAX_PORT_CHECKS=10
-            PORT_CHECK_INTERVAL=5 # Reduced interval slightly, combined with more aggressive killing
-
-            while [ "$PORT_CHECK_COUNT" -lt "$MAX_PORT_CHECKS" ]; do
-                ACTIVE_PORTS=$(sudo lsof -i :${{ secrets.APP_PORT }} -i :5433 | grep LISTEN | awk '{print $1":"$9}' | xargs || true)
-
-                if [ -z "$ACTIVE_PORTS" ]; then
-                    echo "Ports ${{ secrets.APP_PORT }} and 5433 are free."
-                    break
+                if [ -z "$ALL_PIDS" ]; then
+                    echo "Ports ${{ secrets.APP_PORT }} and 5433 are confirmed free."
+                    break # Ports are free, exit loop
                 else
-                    echo "Ports still in use by: $ACTIVE_PORTS. Retrying in $PORT_CHECK_INTERVAL seconds..." >&2
-                    # Try to kill if it's docker-proxy or any related lingering process within the loop
-                    LSOF_PIDS=$(sudo lsof -t -i :${{ secrets.APP_PORT }} -i :5433 | awk '{print $2}' | tail -n +2 | sort -u | xargs || true) # get PIDs only, exclude header
-                    if [ -n "$LSOF_PIDS" ]; then
-                        echo "Attempting to kill processes: $LSOF_PIDS" >&2
-                        sudo kill -9 $LSOF_PIDS || true
-                    fi
-                    sleep "$PORT_CHECK_INTERVAL"
-                    PORT_CHECK_COUNT=$((PORT_CHECK_COUNT + 1))
+                    echo "Ports still in use by PIDs: $ALL_PIDS. Attempting to kill them..." >&2
+                    # Try to kill each PID
+                    for pid in $ALL_PIDS; do
+                        echo "  Killing PID $pid..." >&2
+                        sudo kill -9 "$pid" || true # Force kill
+                    done
+                    sleep "$PORT_CHECK_INTERVAL" # Wait a bit before next check
+                    PORT_CLEANUP_ATTEMPTS=$((PORT_CLEANUP_ATTEMPTS + 1))
                 fi
             done
 
-            if [ "$PORT_CHECK_COUNT" -eq "$MAX_PORT_CHECKS" ]; then
-                echo "ERROR: Ports ${{ secrets.APP_PORT }} or 5433 are still in use after multiple checks. Aborting deployment." >&2
+            if [ "$PORT_CLEANUP_ATTEMPTS" -eq "$MAX_PORT_CLEANUP_ATTEMPTS" ]; then
+                echo "ERROR: Ports ${{ secrets.APP_PORT }} or 5433 are still in use after multiple aggressive cleanup attempts. Aborting deployment." >&2
                 exit 1
             fi
-            echo "Ports are confirmed free. Resuming deployment."
+            echo "--- Advanced Port Cleanup Complete. Resuming deployment. ---"
+            # --- End Advanced Port Cleanup Loop ---
 
             echo "Updating application repository on VPS..."
             if [ ! -d "$APP_DIR" ]; then
@@ -272,9 +262,6 @@ jobs:
             echo "Deploying new application version with docker-compose..."
             for attempt in {1..3}; do
               cd "$APP_DIR"
-              # It's good practice to explicitly pull images defined in docker-compose.yml
-              # though for locally built and pushed image, 'up' often pulls it first.
-              # Explicit pull ensures the correct tag if already present.
               docker compose -p "$PROJECT_NAME" -f docker-compose.yml pull || true
               docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d && break
               echo "Deployment attempt $attempt failed, retrying..." >&2
