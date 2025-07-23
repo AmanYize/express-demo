@@ -1,6 +1,6 @@
 services:
   app:
-    image: ${{ secrets.DOCKER_USERNAME }}/myapp:${APP_VERSION}
+    image: localhost:5000/myapp:${APP_VERSION}
     ports:
       - "${APP_PORT}:3000"
     environment:
