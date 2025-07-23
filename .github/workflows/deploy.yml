@@ -95,11 +95,8 @@ jobs:
             echo '{"insecure-registries": ["37.27.196.138:5000"]}' | sudo tee /etc/docker/daemon.json
             sudo systemctl restart docker
 
-            # Log in to registry
-            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.138:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
-
             # Deploy registry
-            mkdir -p /root/registry
+            mkdir -p /root/registry/auth
             cat << EOF > /root/registry/docker-compose.yml
             version: '3.8'
             services:
@@ -122,12 +119,14 @@ jobs:
             EOF
 
             # Create htpasswd for registry authentication
-            mkdir -p /root/registry/auth
             docker run --entrypoint htpasswd httpd:2 -Bbn "${{ secrets.DOCKER_USERNAME }}" "${{ secrets.DOCKER_PASSWORD }}" > /root/registry/auth/htpasswd
 
             # Start registry
             docker compose -f /root/registry/docker-compose.yml down || true
             docker compose -f /root/registry/docker-compose.yml up -d
+
+            # Log in to registry
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.138:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
             # Create application docker-compose.yml
             cat << EOF > /root/docker-compose.yml
