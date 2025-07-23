@@ -2,18 +2,13 @@ name: Build, Test, and Deploy Node.js Express Demo
 
 on:
   push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
+    branches: [master]
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
       - name: Set up Node.js
         uses: actions/setup-node@v3
@@ -23,26 +18,14 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Fix mocha permissions
-        run: chmod +x ./node_modules/.bin/mocha
-
       - name: Run tests
         run: npm test
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: test-results/*.xml
 
   build-and-deploy:
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
       - name: Set up Node.js
         uses: actions/setup-node@v3
@@ -55,21 +38,25 @@ jobs:
       - name: Build app
         run: npm run build || true
 
-      - name: Docker login to local registry
-        run: echo ${{ secrets.REGISTRY_PASSWORD }} | docker login 37.27.196.138:5000 -u ${{ secrets.REGISTRY_USERNAME }} --password-stdin
+      - name: Trust self-signed cert
+        run: |
+          echo "${{ secrets.REGISTRY_CA }}" | base64 -d > ca.crt
+          sudo mkdir -p /etc/docker/certs.d/37.27.196.138:443
+          sudo cp ca.crt /etc/docker/certs.d/37.27.196.138:443/ca.crt
+          sudo systemctl restart docker
+
+      - name: Log in to private Docker registry
+        run: echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login 37.27.196.138:5000 -u ${{ secrets.REGISTRY_USER }} --password-stdin
 
       - name: Build Docker image
         run: |
-          docker build \
-            --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
-            -t 37.27.196.138:5000/myapp:${{ github.sha }} .
+          docker build -t 37.27.196.138:5000/myapp:${{ github.sha }} .
 
-      - name: Push Docker image to local registry
+      - name: Push Docker image
         run: |
-          echo "Pushing image to 37.27.196.138:5000"
           docker push 37.27.196.138:5000/myapp:${{ github.sha }}
 
-      - name: SSH into VPS and deploy
+      - name: SSH to VPS and deploy
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -81,7 +68,7 @@ jobs:
             export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
             export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
 
-            echo "Using APP_VERSION=${APP_VERSION}"
+            echo "Deploying version $APP_VERSION..."
 
             cat << EOF > /root/docker-compose.yml
             version: '3.8'
@@ -98,7 +85,8 @@ jobs:
                 healthcheck:
                   test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
                   interval: 30s
-                  timeout: 3s
+                  timeout: 5s
+
               postgres:
                 image: postgres:\${POSTGRES_VERSION}
                 environment:
@@ -106,34 +94,16 @@ jobs:
                   - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
                 ports:
                   - "5433:5432"
-                restart: always
                 volumes:
                   - postgres_data:/var/lib/postgresql/data
+                restart: always
+
             volumes:
               postgres_data:
             EOF
 
-            echo "Pulling new image 37.27.196.138:5000/myapp:\${APP_VERSION}"
-            if ! docker pull 37.27.196.138:5000/myapp:\$APP_VERSION; then
-              echo "Failed to pull new image" >&2
-              exit 1
-            fi
-
             docker compose -f /root/docker-compose.yml down || true
+            docker compose -f /root/docker-compose.yml pull
+            docker compose -f /root/docker-compose.yml up -d
 
-            if ! docker compose -f /root/docker-compose.yml up -d; then
-              echo "Deployment failed. Rolling back..." >&2
-              if [ -n "${{ secrets.PREVIOUS_APP_VERSION }}" ]; then
-                export APP_VERSION=${{ secrets.PREVIOUS_APP_VERSION }}
-                docker compose -f /root/docker-compose.yml up -d
-                echo "Rolled back to \$APP_VERSION"
-                exit 1
-              else
-                echo "No previous version available for rollback" >&2
-                exit 1
-              fi
-            fi
-
-            docker images 37.27.196.138:5000/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -I {} docker rmi 37.27.196.138:5000/myapp:{} || true
-
-            echo "\$APP_VERSION" > /root/previous_version.txt
+            docker images 37.27.196.138:5000/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi 37.27.196.138:5000/myapp:{}
