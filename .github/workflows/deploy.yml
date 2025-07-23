@@ -158,9 +158,8 @@ jobs:
                 echo "App directory or docker-compose.yml not found, skipping docker compose down."
             fi
 
-            # New: Prune all unused Docker system resources
             echo "Pruning all unused Docker system resources (images, containers, volumes, networks)..."
-            sudo docker system prune -a -f || true # -a for all unused, -f for force
+            sudo docker system prune -a -f || true
             echo "Docker system pruned."
 
             echo "Force stopping and removing any lingering app or postgres containers (post-prune check)..."
@@ -187,22 +186,28 @@ jobs:
             while [ "$PORT_CLEANUP_ATTEMPTS" -lt "$MAX_PORT_CLEANUP_ATTEMPTS" ]; do
                 echo "Attempt $((PORT_CLEANUP_ATTEMPTS + 1)) of $MAX_PORT_CLEANUP_ATTEMPTS: Checking ports ${{ secrets.APP_PORT }} and 5433."
                 
-                # Use ss -tulpn to get listening processes, more modern than netstat
-                ACTIVE_PIDS_SS=$(sudo ss -tulpn | grep -E ":(${APP_PORT}|5433)\b" | awk '{print $NF}' | cut -d',' -f2 | xargs || true)
+                # Get PIDs from ss, extracting only the number after 'pid='
+                ACTIVE_PIDS_SS=$(sudo ss -tulpn | grep -E ":(${APP_PORT}|5433)\b" | grep -oP 'pid=\K\d+' | xargs || true)
                 
-                # Use lsof as a strong fallback/cross-check
+                # Get PIDs from lsof, which with -t should output only the PID
                 ACTIVE_PIDS_LSOF=$(sudo lsof -t -i :${{ secrets.APP_PORT }} -i :5433 | grep -v "^$" | xargs || true)
 
-                ALL_PIDS=$(echo "$ACTIVE_PIDS_SS $ACTIVE_PIDS_LSOF" | tr ' ' '\n' | sort -u | xargs || true)
+                # Combine PIDs, filter to ensure only numeric PIDs, and get unique values
+                ALL_PIDS=$(echo "$ACTIVE_PIDS_SS $ACTIVE_PIDS_LSOF" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | xargs || true)
 
                 if [ -z "$ALL_PIDS" ]; then
                     echo "Ports ${{ secrets.APP_PORT }} and 5433 are confirmed free."
-                    break # Ports are free, exit loop
+                    break
                 else
                     echo "Ports still in use by PIDs: $ALL_PIDS. Attempting to kill them..." >&2
                     for pid in $ALL_PIDS; do
-                        echo "  Killing PID $pid..." >&2
-                        sudo kill -9 "$pid" || true
+                        # Final validation to ensure PID is numeric before killing
+                        if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                            echo "  Killing PID $pid..." >&2
+                            sudo kill -9 "$pid" || true
+                        else
+                            echo "  Skipping non-numeric PID: '$pid'" >&2
+                        fi
                     done
                     sleep "$PORT_CHECK_INTERVAL"
                     PORT_CLEANUP_ATTEMPTS=$((PORT_CLEANUP_ATTEMPTS + 1))
@@ -258,13 +263,12 @@ jobs:
               cd "$APP_DIR"
               docker compose -p "$PROJECT_NAME" -f docker-compose.yml pull || true
               
-              # *** CRUCIAL CHANGE: Longer sleep before `up -d` ***
               echo "Waiting 30 seconds before starting containers to ensure port release and system readiness..."
               sleep 30 
 
               docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d && break
               echo "Deployment attempt $attempt failed, retrying..." >&2
-              sleep 15 # Shorter sleep for subsequent retries in this loop
+              sleep 15
             done || { echo "Application deployment failed after multiple attempts!"; exit 1; }
             echo "Application deployed successfully."
 
