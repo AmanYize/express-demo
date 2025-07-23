@@ -105,16 +105,29 @@ jobs:
             # Start registry with retries
             echo "Starting registry..."
             for attempt in {1..3}; do
-              docker compose -f "$REGISTRY_COMPOSE_FILE" up -d && break
+              docker compose -f "$REGISTRY_COMPOSE_FILE" up -d
+              # Check if container is running after up command
+              if docker ps --filter "ancestor=registry:2" --filter "status=running" | grep -q "registry"; then
+                echo "Registry container appears to be running."
+                break
+              else
+                echo "Registry container not running after 'up' command. Checking logs for details..." >&2
+                docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true # Show logs of the latest registry container
+              fi
               echo "Registry start attempt $attempt failed, retrying..." >&2
               sleep 5
             done || { echo "Registry failed to start after multiple attempts!"; exit 1; }
             echo "Registry started successfully."
 
-            # Verify registry is running and accessible
-            echo "Verifying registry health..."
-            if ! curl -s http://$REGISTRY_IP:5000/v2/ | grep -q '{}'; then
-              echo "Registry failed health check on HTTP at $REGISTRY_IP:5000" >&2
+            # Verify registry is running and accessible (using localhost for internal check and authentication)
+            echo "Verifying registry health using localhost:5000 with authentication..."
+            if ! curl -s -u "${{ secrets.DOCKER_USERNAME }}:${{ secrets.DOCKER_PASSWORD }}" http://localhost:5000/v2/ | grep -q '{}'; then
+              echo "Registry failed health check on HTTP at localhost:5000" >&2
+              # Add more debug info if health check fails
+              echo "Current docker ps output:" >&2
+              docker ps -a >&2
+              echo "Current docker logs for registry:" >&2
+              docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) >&2
               exit 1
             fi
             echo "Registry health check passed."
