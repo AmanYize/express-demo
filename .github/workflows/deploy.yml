@@ -124,9 +124,13 @@ jobs:
             # Create htpasswd for registry authentication
             docker run --entrypoint htpasswd httpd:2 -Bbn "${{ secrets.DOCKER_USERNAME }}" "${{ secrets.DOCKER_PASSWORD }}" > /root/registry/auth/htpasswd
 
-            # Start registry
+            # Start registry with retries
             docker compose -f /root/registry/docker-compose.yml down || true
-            docker compose -f /root/registry/docker-compose.yml up -d
+            for attempt in {1..3}; do
+              docker compose -f /root/registry/docker-compose.yml up -d && break
+              echo "Registry start attempt $attempt failed, retrying..." >&2
+              sleep 5
+            done
 
             # Verify registry is running
             if ! curl -s http://localhost:5000/v2/ | grep -q '{}'; then
