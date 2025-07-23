@@ -25,7 +25,7 @@ jobs:
         run: chmod +x ./node_modules/.bin/mocha
 
       - name: Run tests
-        run: npm npm test
+        run: npm test
 
       - name: Upload test results
         if: always()
@@ -34,145 +34,255 @@ jobs:
           name: test-results
           path: test-results/*.xml
 
-  deploy:
+  deploy-registry:
     needs: test
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: SSH into VPS and deploy
+      - name: SSH into VPS and deploy registry
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           password: ${{ secrets.VPS_PASSWORD }}
           script: |
-            # --- System Setup and Aggressive Cleanup ---
-            echo "--- Starting System Setup and Cleanup ---"
+            echo "--- Starting Registry Deployment Setup ---"
+            # Install dependencies
             sudo apt update
-            # Ensure Docker and Docker Compose are installed and running
             sudo apt install -y curl git docker.io docker-compose
+
+            # Enable and start Docker
             sudo systemctl enable docker
             sudo systemctl start docker
 
-            # Aggressive cleanup of ALL containers and networks for the project
-            APP_DIR="/root/express-demo"
-            PROJECT_NAME="express-demo" # Derived from your repository's root directory name
+            # Configure insecure registry (using your provided IP)
+            # This is crucial for Docker to allow pushing/pulling from your local registry
+            echo '{"insecure-registries": ["37.27.196.138:5000"]}' | sudo tee /etc/docker/daemon.json
+            sudo systemctl restart docker
+            echo "Docker daemon configured for insecure registry and restarted."
 
-            echo "Attempting to stop and remove all existing containers and networks for project: $PROJECT_NAME"
-            cd /root # Ensure we are not inside the app directory when running general docker commands
-            if [ -f "$APP_DIR/docker-compose.yml" ]; then
-                docker compose -p $PROJECT_NAME -f "$APP_DIR/docker-compose.yml" down --remove-orphans || true
+            # Define registry path
+            REGISTRY_DIR="/root/registry"
+            REGISTRY_COMPOSE_FILE="$REGISTRY_DIR/docker-compose.yml"
+            REGISTRY_AUTH_DIR="$REGISTRY_DIR/auth"
+            REGISTRY_IP="37.27.196.138" # Your VPS public IP for registry
+
+            # Ensure registry directory and auth directory exist
+            mkdir -p "$REGISTRY_AUTH_DIR"
+
+            # Generate registry docker-compose.yml
+            cat << EOF > "$REGISTRY_COMPOSE_FILE"
+            version: '3.8'
+            services:
+              registry:
+                image: registry:2
+                ports:
+                  - "5000:5000"
+                environment:
+                  - REGISTRY_HTTP_ADDR=0.0.0.0:5000
+                  - REGISTRY_HTTP_TLS_ENABLED=false
+                  - REGISTRY_AUTH=htpasswd
+                  - REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm
+                  - REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd
+                volumes:
+                  - registry-data:/var/lib/registry
+                  - $REGISTRY_AUTH_DIR:/auth # Mount auth directory
+                restart: always
+            volumes:
+              registry-data:
+            EOF
+            echo "Registry docker-compose.yml created."
+
+            # Create htpasswd for registry authentication
+            # Using secrets for username/password
+            docker run --entrypoint htpasswd httpd:2 -Bbn "${{ secrets.DOCKER_USERNAME }}" "${{ secrets.DOCKER_PASSWORD }}" > "$REGISTRY_AUTH_DIR/htpasswd"
+            echo "htpasswd file created for registry authentication."
+
+            # Stop and remove old registry containers before starting a new one
+            docker compose -f "$REGISTRY_COMPOSE_FILE" down || true
+            echo "Previous registry containers stopped and removed."
+
+            # Start registry with retries
+            echo "Starting registry..."
+            for attempt in {1..3}; do
+              docker compose -f "$REGISTRY_COMPOSE_FILE" up -d && break
+              echo "Registry start attempt $attempt failed, retrying..." >&2
+              sleep 5
+            done || { echo "Registry failed to start after multiple attempts!"; exit 1; }
+            echo "Registry started successfully."
+
+            # Verify registry is running and accessible
+            echo "Verifying registry health..."
+            if ! curl -s http://$REGISTRY_IP:5000/v2/ | grep -q '{}'; then
+              echo "Registry failed health check on HTTP at $REGISTRY_IP:5000" >&2
+              exit 1
             fi
-            docker rm -f $(docker ps -a -q --filter "ancestor=localhost:5000/myapp" --filter "status=exited") || true
-            docker rm -f $(docker ps -a -q --filter "ancestor=postgres" --filter "status=exited") || true
-            docker rm -f $(docker ps -a -q --filter "name=^${PROJECT_NAME}" -q) || true
+            echo "Registry health check passed."
 
-            # Remove any potentially orphaned docker-proxy processes holding the port
-            echo "Checking and attempting to kill any process still holding port 5433..."
-            LSOF_PIDS=$(sudo lsof -t -i :5433 || true)
-            if [ -n "$LSOF_PIDS" ]; then
-                echo "Found processes on port 5433: $LSOF_PIDS. Attempting to kill them..."
-                sudo kill -9 $LSOF_PIDS || true
-                sleep 5
+            # Configure firewall to allow registry traffic
+            sudo ufw allow 5000
+            echo "Firewall configured to allow port 5000."
+            echo "--- Registry Deployment Complete ---"
+
+  build-and-deploy:
+    needs: deploy-registry # Ensure registry is up before deploying app
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build app (if needed, e.g., for frontend assets)
+        run: npm run build || true # This step depends on your app's build process
+
+      - name: Configure Docker for insecure registry (on runner for build/push)
+        run: |
+          echo '{"insecure-registries": ["37.27.196.138:5000"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          echo "Runner's Docker daemon configured for insecure registry."
+
+      - name: Log in to local Docker registry (on runner for push)
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          echo "Logging into local registry 37.27.196.138:5000..."
+          for attempt in {1..3}; do
+            echo "$DOCKER_PASSWORD" | docker login 37.27.196.138:5000 -u "$DOCKER_USERNAME" --password-stdin && break
+            echo "Login attempt $attempt failed, retrying..." >&2
+            sleep 5
+          done || { echo "Failed to log in to local registry on runner!"; exit 1; }
+          echo "Logged into local registry."
+
+      - name: Build Docker image
+        # This builds the image using your Dockerfile located in the checked-out repo
+        run: |
+          LOCAL_REGISTRY_IMAGE="37.27.196.138:5000/myapp:${{ github.sha }}"
+          echo "Building Docker image: $LOCAL_REGISTRY_IMAGE"
+          docker build \
+            --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
+            -t "$LOCAL_REGISTRY_IMAGE" . || { echo "Docker image build failed!"; exit 1; }
+          echo "Docker image built successfully."
+
+      - name: Push Docker image to registry
+        run: |
+          LOCAL_REGISTRY_IMAGE="37.27.196.138:5000/myapp:${{ github.sha }}"
+          echo "Pushing image $LOCAL_REGISTRY_IMAGE to local registry..."
+          docker push "$LOCAL_REGISTRY_IMAGE" || { echo "Docker image push failed!"; exit 1; }
+          echo "Image pushed successfully to local registry."
+
+      - name: SSH into VPS and deploy application
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          script: |
+            echo "--- Starting Application Deployment on VPS ---"
+            APP_DIR="/root/express-demo" # Consistent application directory
+            PROJECT_NAME="express-demo" # Docker Compose project name
+
+            # Clean up old application containers using the project name
+            # This is key for resolving the "port already allocated" issue for the app
+            echo "Cleaning up previous application containers for project: $PROJECT_NAME..."
+            if [ -d "$APP_DIR" ] && [ -f "$APP_DIR/docker-compose.yml" ]; then
+                cd "$APP_DIR"
+                docker compose -p "$PROJECT_NAME" -f docker-compose.yml down --remove-orphans || true
+                echo "Previous app containers stopped and removed."
             else
-                echo "No processes found on port 5433."
+                echo "App directory or docker-compose.yml not found, skipping docker compose down."
             fi
 
-            docker ps -a | grep registry | awk '{print $1}' | xargs -r docker rm -f || true
+            # Clean up any explicitly exited app/postgres containers
+            docker rm -f $(docker ps -a -q --filter "ancestor=37.27.196.138:5000/myapp" --filter "status=exited") || true
+            docker rm -f $(docker ps -a -q --filter "ancestor=postgres" --filter "status=exited") || true
+            docker rm -f $(docker ps -a -q --filter "name=^${PROJECT_NAME}" -q) || true # Catch running containers from this project
 
-            echo "--- Cleanup Complete ---"
+            # Remove any potentially orphaned docker-proxy processes holding the app/postgres ports
+            echo "Checking and attempting to kill any process still holding app/postgres ports..."
+            # Adjust ports to check based on your APP_PORT and 5433
+            LSOF_PIDS=$(sudo lsof -t -i :${{ secrets.APP_PORT }} -i :5433 || true)
+            if [ -n "$LSOF_PIDS" ]; then
+                echo "Found processes on app/postgres ports: $LSOF_PIDS. Attempting to kill them..."
+                sudo kill -9 $LSOF_PIDS || true
+                sleep 5 # Give some time for the port to release
+            else
+                echo "No processes found on app/postgres ports."
+            fi
 
-            # --- Repository Management ---
-            echo "--- Starting Repository Management ---"
+            # Clone or update repository to ensure the latest docker-compose.yml is present
+            echo "Updating application repository..."
             if [ ! -d "$APP_DIR" ]; then
-              git clone https://github.com/${{ github.repository }} $APP_DIR
+              git clone https://github.com/${{ github.repository }} "$APP_DIR"
             fi
-            cd $APP_DIR
+            cd "$APP_DIR"
             git reset --hard
             git clean -fd
             git pull origin master
-            echo "--- Repository Management Complete ---"
+            echo "Application repository updated."
 
-            # --- Docker Build and Push to Local Registry ---
-            echo "--- Starting Docker Build and Push to Local Registry ---"
-            # Define your local registry address
-            LOCAL_REGISTRY_ADDRESS="localhost:5000" # <--- IMPORTANT: Confirm your local registry address here
-            DOCKER_IMAGE_NAME="$LOCAL_REGISTRY_ADDRESS/myapp"
-            APP_BUILD_TAG="${{ github.sha }}"
+            # Log in to local registry on VPS (for pulling app image)
+            echo "Logging into local registry on VPS..."
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.138:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin || { echo "Docker login on VPS failed!"; exit 1; }
+            echo "Logged into local registry on VPS."
 
-            # No docker login needed if it's an insecure, unauthenticated local registry
-            # If your local registry requires authentication, you'd add 'docker login $LOCAL_REGISTRY_ADDRESS' here
-            # with appropriate credentials (e.g., from secrets, if it's a private registry like Harbor)
-
-            for attempt in {1..3}; do
-              echo "Build attempt $attempt for $DOCKER_IMAGE_NAME:$APP_BUILD_TAG..."
-              docker build \
-                --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
-                -t $LOCAL_REGISTRY_ADDRESS/myapp:$APP_BUILD_TAG . && break # Tag directly with local registry
-              echo "Build attempt $attempt failed, retrying..." >&2
-              sleep 10
-            done || { echo "Docker build failed after multiple attempts!"; exit 1; }
-            echo "Docker build successful."
-
-            echo "Pushing image $DOCKER_IMAGE_NAME:$APP_BUILD_TAG to local registry..."
-            docker push $DOCKER_IMAGE_NAME:$APP_BUILD_TAG || { echo "Docker push to local registry failed! Check registry status and Docker daemon config for insecure-registries."; exit 1; }
-            echo "Image pushed successfully to local registry."
-            echo "--- Docker Build and Push Complete ---"
-
-            # --- Firewall Configuration ---
-            echo "--- Configuring Firewall ---"
-            sudo ufw allow ${{ secrets.APP_PORT }}
-            sudo ufw allow 5433
-            # If your local registry runs on the VPS and needs external access, also allow its port (e.g., 5000)
-            # sudo ufw allow 5000
-            echo "--- Firewall Configuration Complete ---"
-
-            # --- Deployment ---
-            echo "--- Starting Deployment ---"
-            export APP_VERSION=$APP_BUILD_TAG
+            # Export environment variables for docker-compose to use (APP_VERSION, APP_PORT, POSTGRES_*)
+            export APP_VERSION=${{ github.sha }}
             export APP_PORT=${{ secrets.APP_PORT }}
             export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
             export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
-            # No DOCKER_USERNAME needed for docker-compose if using explicit local registry image tag
 
+            # Configure firewall to allow app and postgres traffic
+            echo "Configuring firewall for application ports..."
+            sudo ufw allow ${{ secrets.APP_PORT }}
+            sudo ufw allow 5433
+            echo "Firewall configured."
+
+            # Deploy new version with retries
+            echo "Deploying new application version with docker-compose..."
             for attempt in {1..3}; do
-              echo "Deploy attempt $attempt for $PROJECT_NAME..."
-              docker compose -p $PROJECT_NAME -f docker-compose.yml up -d && break
-              echo "Deploy attempt $attempt failed, retrying..." >&2
+              docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d && break
+              echo "Deployment attempt $attempt failed, retrying..." >&2
               sleep 15
-            done || { echo "Deployment failed after multiple attempts!"; exit 1; }
-            echo "--- Deployment Complete ---"
+            done || { echo "Application deployment failed after multiple attempts!"; exit 1; }
+            echo "Application deployed successfully."
 
-            # --- Verification and Rollback ---
-            echo "--- Starting Verification ---"
-            sleep 10
+            # Verification and Rollback
+            echo "--- Starting Application Verification ---"
+            sleep 10 # Give app time to start
             if ! curl -s http://localhost:${{ secrets.APP_PORT }}/health | grep -q "ok"; then
               echo "Deployment failed health check. Rolling back..." >&2
               PREV_VERSION=$(cat /root/previous_version.txt || echo "")
               if [ -n "$PREV_VERSION" ]; then
-                export APP_VERSION=$PREV_VERSION
-                # No DOCKER_USERNAME needed for pull if using explicit local registry image tag
-                echo "Attempting to pull and roll back to $DOCKER_IMAGE_NAME:$PREV_VERSION from local registry"
-                docker compose -p $PROJECT_NAME -f docker-compose.yml pull app || { echo "Failed to pull previous app image for rollback from local registry!"; exit 1; }
-                docker compose -p $PROJECT_NAME -f docker-compose.yml up -d || { echo "Failed to deploy previous version during rollback!"; exit 1; }
+                export APP_VERSION="$PREV_VERSION" # Set APP_VERSION for rollback
+                echo "Attempting to pull and roll back to 37.27.196.138:5000/myapp:$PREV_VERSION from local registry"
+                docker compose -p "$PROJECT_NAME" -f docker-compose.yml pull app || { echo "Failed to pull previous app image for rollback!"; exit 1; }
+                docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d || { echo "Failed to deploy previous version during rollback!"; exit 1; }
                 echo "Rolled back to $PREV_VERSION"
-                exit 1
+                exit 1 # Exit with error code to indicate rollback happened
               else
                 echo "No previous version available for rollback. Manual intervention required." >&2
                 exit 1
               fi
             fi
-            echo "--- Verification Successful ---"
+            echo "--- Application Verification Successful ---"
 
-            # --- Post-Deployment Cleanup ---
+            # Post-Deployment Cleanup
             echo "--- Starting Post-Deployment Cleanup ---"
             # Clean up old images (keep last 5). Use the full local registry image name.
-            docker images $DOCKER_IMAGE_NAME --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi $DOCKER_IMAGE_NAME:{} || true
-            echo "Old Docker images cleaned up."
+            APP_IMAGE_FULL_NAME="37.27.196.138:5000/myapp"
+            docker images "$APP_IMAGE_FULL_NAME" --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi "$APP_IMAGE_FULL_NAME":{} || true
+            echo "Old Docker application images cleaned up."
 
-            echo "$APP_BUILD_TAG" > /root/previous_version.txt
-            echo "Current version ($APP_BUILD_TAG) saved for future rollback."
+            # Save current version for future rollback
+            echo "${{ github.sha }}" > /root/previous_version.txt
+            echo "Current version (${{ github.sha }}) saved for future rollback."
             echo "--- Post-Deployment Cleanup Complete ---"

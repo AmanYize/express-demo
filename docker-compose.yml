@@ -1,6 +1,6 @@
 services:
   app:
-    image: localhost:5000/myapp:${APP_VERSION}
+    image: 37.27.196.138:5000/myapp:${APP_VERSION}
     ports:
       - "${APP_PORT}:3000"
     environment:
