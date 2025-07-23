@@ -49,27 +49,58 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           password: ${{ secrets.VPS_PASSWORD }}
           script: |
-            # Install dependencies
+            # --- System Setup and Cleanup ---
             sudo apt update
-            sudo apt remove -y containerd containerd.io
-            sudo apt install -y -f
+            sudo apt remove -y containerd containerd.io || true # Ensure containerd is removed cleanly if present
+            sudo apt install -y -f # Fix broken dependencies
             sudo apt install -y curl git docker.io docker-compose
             sudo systemctl enable docker
             sudo systemctl start docker
 
-            # Clean up old registry containers (if any)
+            # Aggressive cleanup of potential leftover containers/networks from previous runs
+            # This is key to fix the port conflict.
+            # Identify and stop/remove any existing containers for the project
+            PROJECT_NAME="express-demo" # Or whatever your docker-compose project name is (usually derived from directory name)
+            echo "Attempting to stop and remove all containers for project: $PROJECT_NAME"
+            docker compose -p $PROJECT_NAME -f /root/$PROJECT_NAME/docker-compose.yml down --remove-orphans || true
+            docker rm -f $(docker ps -a -q --filter "ancestor=myapp" --filter "status=exited") || true # Remove exited app containers
+            docker rm -f $(docker ps -a -q --filter "ancestor=postgres" --filter "status=exited") || true # Remove exited postgres containers
+
+            # Attempt to kill any process still holding port 5433 (rare, but good for robustness)
+            echo "Checking and attempting to kill processes on port 5433..."
+            LSOF_OUTPUT=$(sudo lsof -t -i :5433 || true) # Get PIDs, handle if no process
+            if [ -n "$LSOF_OUTPUT" ]; then
+                echo "Processes found on port 5433: $LSOF_OUTPUT"
+                sudo kill -9 $LSOF_OUTPUT || true # Force kill the processes
+                echo "Killed processes on port 5433. Waiting a moment..."
+                sleep 5
+            else
+                echo "No processes found on port 5433."
+            fi
+
+            # Clean up old registry containers (if any from other Docker operations)
             docker ps -a | grep registry | awk '{print $1}' | xargs -r docker rm -f || true
 
+            # --- Repository Management ---
+            # Define the application directory
+            APP_DIR="/root/express-demo"
+
             # Clone or update repository and navigate into the app directory
-            if [ ! -d "/root/express-demo" ]; then
-              git clone https://github.com/${{ github.repository }} /root/express-demo
+            if [ ! -d "$APP_DIR" ]; then
+              git clone https://github.com/${{ github.repository }} $APP_DIR
             fi
-            cd /root/express-demo
+            cd $APP_DIR
             git reset --hard
             git clean -fd
             git pull origin master
 
-            # Build Docker image with retries, referencing the Dockerfile in the current directory
+            # --- Docker Build and Push ---
+            # Log in to Docker Hub (or other registry) before building if pushing
+            # Ensure DOCKER_USERNAME and DOCKER_PASSWORD are set as GitHub Secrets
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login --username "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+            # Build Docker image with retries
+            # The Dockerfile is in the current directory ($APP_DIR)
             for attempt in {1..3}; do
               docker build \
                 --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
@@ -78,31 +109,41 @@ jobs:
               sleep 5
             done
 
-            # Configure firewall
+            # Tag and Push the image to your registry
+            # Replace 'your_registry_username' with your actual Docker Hub username or registry path
+            DOCKER_IMAGE_FULL_TAG="${{ secrets.DOCKER_USERNAME }}/myapp:${{ github.sha }}" # Use a secret for username
+            docker tag myapp:${{ github.sha }} $DOCKER_IMAGE_FULL_TAG
+            docker push $DOCKER_IMAGE_FULL_TAG
+
+            # --- Firewall Configuration ---
             sudo ufw allow ${{ secrets.APP_PORT }}
-            sudo ufw allow 5433
+            sudo ufw allow 5433 # Ensure this port is allowed
 
-            # Stop and remove old containers using the docker-compose.yml in the current directory
-            docker compose -f docker-compose.yml down || true
-
-            # Deploy new version with retries using the docker-compose.yml in the current directory
+            # --- Deployment ---
             export APP_VERSION=${{ github.sha }}
             export APP_PORT=${{ secrets.APP_PORT }}
             export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
             export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            export DOCKER_REGISTRY_USER="${{ secrets.DOCKER_USERNAME }}" # Pass registry user for app image
+
+            # Deploy new version with retries
             for attempt in {1..3}; do
+              # Use the full image name in compose, pulling from registry if needed
+              # Assuming your docker-compose.yml 'app' service now uses 'image: ${{ secrets.DOCKER_USERNAME }}/myapp:${APP_VERSION}'
               docker compose -f docker-compose.yml up -d && break
               echo "Deploy attempt $attempt failed, retrying..." >&2
               sleep 5
             done
 
-            # Verify deployment
+            # --- Verification and Rollback ---
             sleep 10
             if ! curl -s http://localhost:${{ secrets.APP_PORT }}/health | grep -q "ok"; then
               echo "Deployment failed health check. Rolling back..." >&2
               PREV_VERSION=$(cat /root/previous_version.txt || echo "")
               if [ -n "$PREV_VERSION" ]; then
                 export APP_VERSION=$PREV_VERSION
+                # Ensure docker compose pulls the previous version from the registry
+                docker compose -f docker-compose.yml pull app # Explicitly pull the app image
                 docker compose -f docker-compose.yml up -d
                 echo "Rolled back to $PREV_VERSION"
                 exit 1
@@ -112,8 +153,9 @@ jobs:
               fi
             fi
 
-            # Clean up old images (keep last 5)
-            docker images myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi myapp:{} || true
+            # --- Post-Deployment Cleanup ---
+            # Clean up old images (keep last 5). Use the full image name from your registry.
+            docker images "${{ secrets.DOCKER_USERNAME }}/myapp" --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi "${{ secrets.DOCKER_USERNAME }}/myapp":{} || true
 
             # Save current version for future rollback
             echo "${{ github.sha }}" > /root/previous_version.txt
