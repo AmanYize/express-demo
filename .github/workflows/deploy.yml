@@ -203,33 +203,57 @@ jobs:
             APP_DIR="/root/express-demo" # Consistent application directory
             PROJECT_NAME="express-demo" # Docker Compose project name
 
-            # Clean up old application containers using the project name
-            # This is key for resolving the "port already allocated" issue for the app
-            echo "Cleaning up previous application containers for project: $PROJECT_NAME..."
+            # 1. Aggressive Cleanup of application-related containers and processes
+            echo "--- Starting Aggressive Application Cleanup ---"
+            cd /root # Ensure we are not inside the app directory for initial broad commands
+
+            # Stop and remove containers by project name (most common for compose)
+            echo "Attempting docker compose down for project: $PROJECT_NAME..."
             if [ -d "$APP_DIR" ] && [ -f "$APP_DIR/docker-compose.yml" ]; then
                 cd "$APP_DIR"
-                docker compose -p "$PROJECT_NAME" -f docker-compose.yml down --remove-orphans || true
-                echo "Previous app containers stopped and removed."
+                # Use --timeout 0 for immediate stop, --rmi all to remove images, --volumes to remove named volumes
+                docker compose -p "$PROJECT_NAME" -f docker-compose.yml down --timeout 0 --rmi all --volumes --remove-orphans || true
+                echo "docker compose down completed for $PROJECT_NAME."
+                cd /root # Change back to root after docker compose down
             else
                 echo "App directory or docker-compose.yml not found, skipping docker compose down."
             fi
 
-            # Clean up any explicitly exited app/postgres containers
-            docker rm -f $(docker ps -a -q --filter "ancestor=37.27.196.138:5000/myapp" --filter "status=exited") || true
-            docker rm -f $(docker ps -a -q --filter "ancestor=postgres" --filter "status=exited") || true
-            docker rm -f $(docker ps -a -q --filter "name=^${PROJECT_NAME}" -q) || true # Catch running containers from this project
+            # Force stop/remove any remaining containers related to app or postgres images
+            echo "Force stopping and removing any lingering app or postgres containers..."
+            # Get IDs of containers derived from your app image or postgres image
+            OLD_APP_CONTAINERS=$(docker ps -a -q --filter "ancestor=37.27.196.138:5000/myapp" || true)
+            OLD_POSTGRES_CONTAINERS=$(docker ps -a -q --filter "ancestor=postgres" || true)
 
-            # Remove any potentially orphaned docker-proxy processes holding the app/postgres ports
-            echo "Checking and attempting to kill any process still holding app/postgres ports..."
-            # Adjust ports to check based on your APP_PORT and 5433
-            LSOF_PIDS=$(sudo lsof -t -i :${{ secrets.APP_PORT }} -i :5433 || true)
-            if [ -n "$LSOF_PIDS" ]; then
-                echo "Found processes on app/postgres ports: $LSOF_PIDS. Attempting to kill them..."
-                sudo kill -9 $LSOF_PIDS || true
-                sleep 5 # Give some time for the port to release
-            else
-                echo "No processes found on app/postgres ports."
+            if [ -n "$OLD_APP_CONTAINERS" ]; then
+                echo "Stopping and removing old app containers: $OLD_APP_CONTAINERS"
+                docker stop $OLD_APP_CONTAINERS || true
+                docker rm -f $OLD_APP_CONTAINERS || true # Use -f for force removal
             fi
+            if [ -n "$OLD_POSTGRES_CONTAINERS" ]; then
+                echo "Stopping and removing old postgres containers: $OLD_POSTGRES_CONTAINERS"
+                docker stop $OLD_POSTGRES_CONTAINERS || true
+                docker rm -f $OLD_POSTGRES_CONTAINERS || true # Use -f for force removal
+            fi
+
+            # Aggressively kill any process holding the ports (last resort and primary fix for stubborn issues)
+            echo "Checking and attempting to kill any process still holding ports ${{ secrets.APP_PORT }} or 5433..."
+            LSOF_PIDS=$(sudo lsof -t -i :${{ secrets.APP_PORT }} -i :5433 | grep -v "^$" || true)
+
+            if [ -n "$LSOF_PIDS" ]; then
+                echo "Found processes on ports ${{ secrets.APP_PORT }} or 5433 (PIDs: $LSOF_PIDS). Attempting to kill them..."
+                sudo kill -9 $LSOF_PIDS || true # Force kill
+                sleep 15 # *** Increased sleep to ensure port release ***
+                echo "Confirmed killed processes on ports ${{ secrets.APP_PORT }} or 5433."
+            else
+                echo "No processes found holding ports ${{ secrets.APP_PORT }} or 5433."
+            fi
+            echo "--- Aggressive Application Cleanup Complete ---"
+
+            # *** Critical Delay to Allow Port Release ***
+            echo "Sleeping for 20 seconds to ensure ports are fully released before deployment..."
+            sleep 20
+            echo "Resuming deployment."
 
             # Clone or update repository to ensure the latest docker-compose.yml is present
             echo "Updating application repository..."
@@ -262,6 +286,8 @@ jobs:
             # Deploy new version with retries
             echo "Deploying new application version with docker-compose..."
             for attempt in {1..3}; do
+              # Ensure we're in the right directory for docker compose
+              cd "$APP_DIR"
               docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d && break
               echo "Deployment attempt $attempt failed, retrying..." >&2
               sleep 15
@@ -277,6 +303,8 @@ jobs:
               if [ -n "$PREV_VERSION" ]; then
                 export APP_VERSION="$PREV_VERSION" # Set APP_VERSION for rollback
                 echo "Attempting to pull and roll back to 37.27.196.138:5000/myapp:$PREV_VERSION from local registry"
+                # Ensure we are in the app directory for rollback compose commands
+                cd "$APP_DIR"
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml pull app || { echo "Failed to pull previous app image for rollback!"; exit 1; }
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d || { echo "Failed to deploy previous version during rollback!"; exit 1; }
                 echo "Rolled back to $PREV_VERSION"
