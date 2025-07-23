@@ -55,6 +55,9 @@ jobs:
       - name: Build app
         run: npm run build || true
 
+      - name: Docker login to local registry
+        run: echo ${{ secrets.REGISTRY_PASSWORD }} | docker login 37.27.196.138:5000 -u ${{ secrets.REGISTRY_USERNAME }} --password-stdin
+
       - name: Build Docker image
         run: |
           docker build \
