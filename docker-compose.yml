@@ -27,7 +27,7 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data # This refers to the named volume
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -35,5 +35,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
 volumes:
-  - postgres_data
+  postgres_data: # Correctly defined as a named volume mapping
