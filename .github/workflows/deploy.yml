@@ -2,11 +2,9 @@ name: Build, Test, and Deploy Node.js Express Demo
 
 on:
   push:
-    branches:
-      - master
+    branches: [ master ]
   pull_request:
-    branches:
-      - master
+    branches: [ master ]
 
 jobs:
   test:
@@ -55,12 +53,17 @@ jobs:
       - name: Build app
         run: npm run build || true
 
-      - name: Log in to Docker registry (insecure HTTP)
+      - name: Configure Docker for insecure registry
+        run: |
+          echo '{"insecure-registries": ["37.27.196.138:5000"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      - name: Log in to Docker registry
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          docker login 37.27.196.138:5000 -u "$DOCKER_USERNAME" --password-stdin <<< "$DOCKER_PASSWORD"
+          echo "$DOCKER_PASSWORD" | docker login 37.27.196.138:5000 -u "$DOCKER_USERNAME" --password-stdin
 
       - name: Build Docker image
         run: |
@@ -68,10 +71,10 @@ jobs:
             --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
             -t 37.27.196.138:5000/myapp:${{ github.sha }} .
 
-      - name: Push Docker image to registry (skip TLS verify)
+      - name: Push Docker image to registry
         run: |
           echo "Pushing image to 37.27.196.138:5000"
-          docker push 37.27.196.138:5000/myapp:${{ github.sha }} --tls-verify=false
+          docker push 37.27.196.138:5000/myapp:${{ github.sha }}
 
       - name: SSH into VPS and deploy
         uses: appleboy/ssh-action@master
@@ -80,57 +83,116 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           password: ${{ secrets.VPS_PASSWORD }}
           script: |
-            export APP_VERSION=${{ github.sha }}
-            export APP_PORT=${{ secrets.APP_PORT }}
-            export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
-            export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            # Install dependencies
+            sudo apt update
+            sudo apt install -y curl git docker.io docker-compose
 
-            echo "Using APP_VERSION=${APP_VERSION}"
+            # Enable and start Docker
+            sudo systemctl enable docker
+            sudo systemctl start docker
 
+            # Configure insecure registry
+            echo '{"insecure-registries": ["37.27.196.138:5000"]}' | sudo tee /etc/docker/daemon.json
+            sudo systemctl restart docker
+
+            # Log in to registry
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.138:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+            # Deploy registry
+            mkdir -p /root/registry
+            cat << EOF > /root/registry/docker-compose.yml
+            version: '3.8'
+            services:
+              registry:
+                image: registry:2
+                ports:
+                  - "5000:5000"
+                environment:
+                  - REGISTRY_HTTP_ADDR=0.0.0.0:5000
+                  - REGISTRY_HTTP_TLS_ENABLED=false
+                  - REGISTRY_AUTH=htpasswd
+                  - REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm
+                  - REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd
+                volumes:
+                  - registry-data:/var/lib/registry
+                  - /root/registry/auth:/auth
+                restart: always
+            volumes:
+              registry-data:
+            EOF
+
+            # Create htpasswd for registry authentication
+            mkdir -p /root/registry/auth
+            docker run --entrypoint htpasswd httpd:2 -Bbn "${{ secrets.DOCKER_USERNAME }}" "${{ secrets.DOCKER_PASSWORD }}" > /root/registry/auth/htpasswd
+
+            # Start registry
+            docker compose -f /root/registry/docker-compose.yml down || true
+            docker compose -f /root/registry/docker-compose.yml up -d
+
+            # Create application docker-compose.yml
             cat << EOF > /root/docker-compose.yml
             version: '3.8'
             services:
               app:
-                image: 37.27.196.138:5000/myapp:\${APP_VERSION}
+                image: 37.27.196.138:5000/myapp:${{ github.sha }}
                 ports:
-                  - "\${APP_PORT}:3000"
+                  - "${{ secrets.APP_PORT }}:3000"
                 environment:
-                  - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
+                  - POSTGRES_HOST=postgres
+                  - POSTGRES_DB=mydb
+                  - POSTGRES_USER=postgres
+                  - POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
                 depends_on:
-                  - postgres
+                  postgres:
+                    condition: service_healthy
                 restart: always
                 healthcheck:
                   test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
                   interval: 30s
                   timeout: 3s
+                  retries: 3
+                  start_period: 10s
               postgres:
-                image: postgres:\${POSTGRES_VERSION}
+                image: postgres:${{ secrets.POSTGRES_VERSION }}
                 environment:
                   - POSTGRES_DB=mydb
-                  - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
+                  - POSTGRES_USER=postgres
+                  - POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
                 ports:
                   - "5433:5432"
-                restart: always
                 volumes:
                   - postgres_data:/var/lib/postgresql/data
+                restart: always
+                healthcheck:
+                  test: ["CMD-SHELL", "pg_isready -U postgres"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 5
+                  start_period: 10s
             volumes:
               postgres_data:
             EOF
 
-            echo "Pulling new image 37.27.196.138:5000/myapp:\${APP_VERSION}"
-            if ! docker pull 37.27.196.138:5000/myapp:\$APP_VERSION; then
-              echo "Failed to pull new image" >&2
-              exit 1
-            fi
+            # Configure firewall
+            sudo ufw allow 5000
+            sudo ufw allow ${{ secrets.APP_PORT }}
+            sudo ufw allow 5433
 
+            # Pull image
+            docker pull 37.27.196.138:5000/myapp:${{ github.sha }} || true
+
+            # Stop and remove old containers
             docker compose -f /root/docker-compose.yml down || true
 
+            # Deploy new version
             if ! docker compose -f /root/docker-compose.yml up -d; then
               echo "Deployment failed. Rolling back..." >&2
-              if [ -n "${{ secrets.PREVIOUS_APP_VERSION }}" ]; then
-                export APP_VERSION=${{ secrets.PREVIOUS_APP_VERSION }}
+              PREV_VERSION=$(cat /root/previous_version.txt || echo "")
+              if [ -n "$PREV_VERSION" ]; then
+                export APP_VERSION=$PREV_VERSION
+                sed -i "s|37.27.196.138:5000/myapp:.*|37.27.196.138:5000/myapp:$APP_VERSION|" /root/docker-compose.yml
                 docker compose -f /root/docker-compose.yml up -d
-                echo "Rolled back to \$APP_VERSION"
+                echo "Rolled back to $PREV_VERSION"
                 exit 1
               else
                 echo "No previous version available for rollback" >&2
@@ -138,6 +200,8 @@ jobs:
               fi
             fi
 
-            docker images 37.27.196.138:5000/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -I {} docker rmi 37.27.196.138:5000/myapp:{} || true
+            # Clean up old images (keep last 5)
+            docker images 37.27.196.138:5000/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi 37.27.196.138:5000/myapp:{} || true
 
-            echo "\$APP_VERSION" > /root/previous_version.txt
+            # Save current version for future rollback
+            echo "${{ github.sha }}" > /root/previous_version.txt

@@ -1,125 +1,39 @@
-name: Build, Test, and Deploy Node.js Express Demo
-
-on:
-  push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Fix mocha permissions
-        run: chmod +x ./node_modules/.bin/mocha
-
-      - name: Run tests
-        run: npm test
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: test-results/*.xml
-
-  deploy:
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: SSH, Build, Push & Deploy on VPS
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          password: ${{ secrets.VPS_PASSWORD }}
-          script: |
-            cd /root/your-app-folder || mkdir -p /root/your-app-folder && cd /root/your-app-folder
-
-            # Copy app source code to VPS (optional: use git clone or rsync here if you want)
-            # For simplicity, you can do a git pull if repo exists
-            if [ -d ".git" ]; then
-              git reset --hard
-              git clean -fd
-              git pull origin master
-            else
-              git clone https://github.com/your-username/your-repo.git .
-            fi
-
-            # Build Docker image locally on VPS with GitHub SHA as tag
-            docker build -t 37.27.196.138:5000/myapp:${GITHUB_SHA} --build-arg NODE_VERSION=18 .
-
-            # Push image to local insecure registry on VPS
-            docker push 37.27.196.138:5000/myapp:${GITHUB_SHA}
-
-            # Create docker-compose.yml to deploy containers
-            cat << EOF > /root/docker-compose.yml
-            version: '3.8'
-            services:
-              app:
-                image: 37.27.196.138:5000/myapp:${GITHUB_SHA}
-                ports:
-                  - "${{ secrets.APP_PORT }}:3000"
-                environment:
-                  - POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
-                depends_on:
-                  - postgres
-                restart: always
-                healthcheck:
-                  test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
-                  interval: 30s
-                  timeout: 3s
-              postgres:
-                image: postgres:${{ secrets.POSTGRES_VERSION }}
-                environment:
-                  - POSTGRES_DB=mydb
-                  - POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
-                ports:
-                  - "5433:5432"
-                restart: always
-                volumes:
-                  - postgres_data:/var/lib/postgresql/data
-            volumes:
-              postgres_data:
-            EOF
-
-            # Pull image (should be local but let's ensure)
-            docker pull 37.27.196.138:5000/myapp:${GITHUB_SHA} || true
-
-            # Stop and remove old containers
-            docker compose -f /root/docker-compose.yml down || true
-
-            # Deploy new version
-            if ! docker compose -f /root/docker-compose.yml up -d; then
-              echo "Deployment failed. Rolling back..." >&2
-              PREV_VERSION=$(cat /root/previous_version.txt || echo "")
-              if [ -n "$PREV_VERSION" ]; then
-                docker compose -f /root/docker-compose.yml up -d --no-deps -d 37.27.196.138:5000/myapp:$PREV_VERSION
-                echo "Rolled back to $PREV_VERSION"
-                exit 1
-              else
-                echo "No previous version available for rollback" >&2
-                exit 1
-              fi
-            fi
-
-            # Clean up old images (keep last 5)
-            docker images 37.27.196.138:5000/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi 37.27.196.138:5000/myapp:{} || true
-
-            # Save current version for future rollback
-            echo "${GITHUB_SHA}" > /root/previous_version.txt
+services:
+  app:
+    image: 37.27.196.138:5000/myapp:${APP_VERSION}
+    ports:
+      - "${APP_PORT}:3000"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=mydb
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_DB=mydb
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+volumes:
+  postgres_data:

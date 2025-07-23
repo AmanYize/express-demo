@@ -1,0 +1,13 @@
+     version: 0.1
+     log:
+       fields:
+         service: registry
+     storage:
+       cache:
+         blobdescriptor: inmemorycompiled
+       filesystem:
+         rootdirectory: /var/lib/registry
+     http:
+       addr: 0.0.0.0:5000
+       tls:
+         enabled: false
