@@ -60,15 +60,18 @@ jobs:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          echo "$DOCKER_PASSWORD" | docker login 37.27.196.138:5000 -u "$DOCKER_USERNAME" --password-stdin
+          echo "$DOCKER_PASSWORD" | docker login 37.27.196.138 -u "$DOCKER_USERNAME" --password-stdin
 
       - name: Build Docker image
         run: |
-          docker build -t 37.27.196.138:5000/myapp:${{ github.sha }} .
+          docker build \
+            --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
+            -t 37.27.196.138/myapp:${{ github.sha }} .
 
-      - name: Push Docker image to local registry
+      - name: Push Docker image to registry
         run: |
-          docker push 37.27.196.138:5000/myapp:${{ github.sha }}
+          echo "Pushing image to 37.27.196.138"
+          docker push 37.27.196.138/myapp:${{ github.sha }}
 
       - name: SSH into VPS and deploy
         uses: appleboy/ssh-action@master
@@ -82,11 +85,13 @@ jobs:
             export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
             export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
 
+            echo "Using APP_VERSION=${APP_VERSION}"
+
             cat << EOF > /root/docker-compose.yml
             version: '3.8'
             services:
               app:
-                image: 37.27.196.138:5000/myapp:\${APP_VERSION}
+                image: 37.27.196.138/myapp:\${APP_VERSION}
                 ports:
                   - "\${APP_PORT}:3000"
                 environment:
@@ -112,8 +117,8 @@ jobs:
               postgres_data:
             EOF
 
-            echo "Pulling new image 37.27.196.138:5000/myapp:\${APP_VERSION}"
-            if ! docker pull 37.27.196.138:5000/myapp:\$APP_VERSION; then
+            echo "Pulling new image 37.27.196.138/myapp:\${APP_VERSION}"
+            if ! docker pull 37.27.196.138/myapp:\$APP_VERSION; then
               echo "Failed to pull new image" >&2
               exit 1
             fi
@@ -122,9 +127,8 @@ jobs:
 
             if ! docker compose -f /root/docker-compose.yml up -d; then
               echo "Deployment failed. Rolling back..." >&2
-              if [ -f /root/previous_version.txt ]; then
-                PREV_VERSION=$(cat /root/previous_version.txt)
-                export APP_VERSION=\$PREV_VERSION
+              if [ -n "${{ secrets.PREVIOUS_APP_VERSION }}" ]; then
+                export APP_VERSION=${{ secrets.PREVIOUS_APP_VERSION }}
                 docker compose -f /root/docker-compose.yml up -d
                 echo "Rolled back to \$APP_VERSION"
                 exit 1
@@ -134,6 +138,6 @@ jobs:
               fi
             fi
 
-            docker images 37.27.196.138:5000/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r docker rmi || true
+            docker images 37.27.196.138/myapp --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -I {} docker rmi 37.27.196.138/myapp:{} || true
 
             echo "\$APP_VERSION" > /root/previous_version.txt
