@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # This job runs on the default AMD64 runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -36,7 +36,7 @@ jobs:
 
   deploy-registry:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # This job runs on the default AMD64 runner
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - name: SSH into VPS and deploy registry
@@ -138,74 +138,22 @@ jobs:
             echo "--- Registry Deployment Complete ---"
 
   build-and-deploy:
-    needs: deploy-registry # Ensure registry is up before deploying app
-    runs-on: ubuntu-latest
+    needs: deploy-registry
+    runs-on: ubuntu-latest # This job runs on the default AMD64 runner
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
-      - name: Checkout code
+      - name: Checkout code (on GitHub Actions Runner)
         uses: actions/checkout@v3
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
+      # Removed all Node.js setup and dependency installation steps here
+      # as we will do that on the VPS directly before building the image.
+      # Removed all Docker Buildx specific steps.
 
-      - name: Install dependencies
-        run: npm install
+      # The Docker login and insecure-registries config are now only needed on the VPS
+      # if you intend to push the image to your private registry from the VPS after building.
+      # It's generally good practice to do so for image management.
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # --- Start Buildx Stability Fixes ---
-      - name: Clean up existing Buildx builders (important for fresh state)
-        run: docker buildx rm mybuilder || true # Remove the specific builder if it exists, ignore errors
-
-      - name: Configure Buildx for Insecure Registry and Bootstrap
-        run: |
-          BUILDER_NAME="mybuilder"
-          REGISTRY_IP="37.27.196.198" # Ensure this matches your registry's IP
-
-          echo "Creating/reconfiguring Buildx builder '$BUILDER_NAME' with insecure registry support..."
-          docker buildx create --name $BUILDER_NAME --use --driver docker-container --buildkitd-flags "--allow-insecure-entitlement"
-          echo "Bootstrapping Buildx builder..."
-          docker buildx inspect --bootstrap # Ensures the builder is running and ready
-
-          echo "Giving Buildx builder a moment to stabilize..."
-          sleep 10 # Added delay to allow buildkitd to fully start and stabilize
-      # --- End Buildx Stability Fixes ---
-
-      - name: Configure Docker for insecure registry (on runner for build/push)
-        run: |
-          echo '{"insecure-registries": ["37.27.196.198:5000"]}' | sudo tee /etc/docker/daemon.json
-          sudo systemctl restart docker
-          echo "Runner's Docker daemon configured for insecure registry."
-
-      - name: Log in to local Docker registry (on runner for push)
-        env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-        run: |
-          echo "Logging into local registry 37.27.196.198:5000..."
-          for attempt in {1..3}; do
-            echo "$DOCKER_PASSWORD" | docker login 37.27.196.198:5000 -u "$DOCKER_USERNAME" --password-stdin && break
-            echo "Login attempt $attempt failed, retrying..." >&2
-            sleep 5
-          done || { echo "Failed to log in to local registry on runner!"; exit 1; }
-          echo "Logged into local registry."
-
-      - name: Build and Push Docker image to registry for multiple platforms
-        run: |
-          LOCAL_REGISTRY_IMAGE="37.27.196.198:5000/myapp"
-          APP_BUILD_TAG="${{ github.sha }}"
-          echo "Building and pushing multi-platform Docker image: ${LOCAL_REGISTRY_IMAGE}:${APP_BUILD_TAG}"
-          docker buildx build \
-            --platform linux/amd64,linux/arm64/v8 \
-            --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
-            -t "${LOCAL_REGISTRY_IMAGE}:${APP_BUILD_TAG}" \
-            --push . || { echo "Multi-platform Docker image build and push failed!"; exit 1; }
-          echo "Multi-platform Docker image built and pushed successfully."
-
-      - name: SSH into VPS and deploy application
+      - name: SSH into VPS, Build, and Deploy application
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -215,6 +163,8 @@ jobs:
             echo "--- Starting Application Deployment on VPS ---"
             APP_DIR="/root/express-demo" # Consistent application directory
             PROJECT_NAME="express-demo" # Docker Compose project name
+            LOCAL_REGISTRY_IMAGE="37.27.196.198:5000/myapp" # Your registry image name
+            APP_BUILD_TAG="${{ github.sha }}" # Tag for the image
 
             # 1. Aggressive Cleanup of application-related containers and processes
             echo "--- Starting Aggressive Application Cleanup ---"
@@ -235,7 +185,7 @@ jobs:
             # Force stop/remove any remaining containers related to app or postgres images
             echo "Force stopping and removing any lingering app or postgres containers..."
             # Get IDs of containers derived from your app image or postgres image
-            OLD_APP_CONTAINERS=$(docker ps -a -q --filter "ancestor=37.27.196.198:5000/myapp" || true)
+            OLD_APP_CONTAINERS=$(docker ps -a -q --filter "ancestor=${LOCAL_REGISTRY_IMAGE}" || true) # Use the full image name
             OLD_POSTGRES_CONTAINERS=$(docker ps -a -q --filter "ancestor=postgres" || true)
 
             if [ -n "$OLD_APP_CONTAINERS" ]; then
@@ -296,8 +246,8 @@ jobs:
             echo "Ports are confirmed free. Resuming deployment."
             # --- End Port Check ---
 
-            # Clone or update repository to ensure the latest docker-compose.yml is present
-            echo "Updating application repository..."
+            # Clone or update repository to ensure the latest code and docker-compose.yml are present
+            echo "Updating application repository on VPS..."
             if [ ! -d "$APP_DIR" ]; then
               git clone https://github.com/${{ github.repository }} "$APP_DIR"
             fi
@@ -305,14 +255,30 @@ jobs:
             git reset --hard
             git clean -fd
             git pull origin master
-            echo "Application repository updated."
+            echo "Application repository updated on VPS."
 
-            # Log in to local registry on VPS (for pulling app image)
-            echo "Logging into local registry on VPS..."
+            # Log in to local registry on VPS (for pushing the newly built app image)
+            echo "Logging into local registry on VPS for push..."
             echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.198:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin || { echo "Docker login on VPS failed!"; exit 1; }
             echo "Logged into local registry on VPS."
 
-            # Export environment variables for docker-compose to use (APP_VERSION, APP_PORT, POSTGRES_*)
+            # Build the Docker image natively on the VPS
+            echo "Building Docker image natively on VPS..."
+            # Ensure NODE_VERSION is available as a build arg if your Dockerfile uses it
+            docker build \
+              --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
+              -t "${LOCAL_REGISTRY_IMAGE}:${APP_BUILD_TAG}" \
+              -t "${LOCAL_REGISTRY_IMAGE}:latest" \
+              . || { echo "Docker image build on VPS failed!"; exit 1; }
+            echo "Docker image built on VPS successfully."
+
+            # Push the newly built image to your local registry (for record-keeping/rollback)
+            echo "Pushing newly built image to local registry from VPS..."
+            docker push "${LOCAL_REGISTRY_IMAGE}:${APP_BUILD_TAG}" || { echo "Docker image push to local registry failed!"; exit 1; }
+            docker push "${LOCAL_REGISTRY_IMAGE}:latest" || { echo "Docker image latest tag push failed!"; exit 1; }
+            echo "Image pushed to local registry."
+
+            # Export environment variables for docker-compose to use
             export APP_VERSION=${{ github.sha }}
             export APP_PORT=${{ secrets.APP_PORT }}
             export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
@@ -343,7 +309,7 @@ jobs:
               PREV_VERSION=$(cat /root/previous_version.txt || echo "")
               if [ -n "$PREV_VERSION" ]; then
                 export APP_VERSION="$PREV_VERSION" # Set APP_VERSION for rollback
-                echo "Attempting to pull and roll back to 37.27.196.198:5000/myapp:$PREV_VERSION from local registry"
+                echo "Attempting to pull and roll back to ${LOCAL_REGISTRY_IMAGE}:$PREV_VERSION from local registry"
                 # Ensure we are in the app directory for rollback compose commands
                 cd "$APP_DIR"
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml pull app || { echo "Failed to pull previous app image for rollback!"; exit 1; }
@@ -360,8 +326,7 @@ jobs:
             # Post-Deployment Cleanup
             echo "--- Starting Post-Deployment Cleanup ---"
             # Clean up old images (keep last 5). Use the full local registry image name.
-            APP_IMAGE_FULL_NAME="37.27.196.198:5000/myapp"
-            docker images "$APP_IMAGE_FULL_NAME" --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi "$APP_IMAGE_FULL_NAME":{} || true
+            docker images "${LOCAL_REGISTRY_IMAGE}" --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi "${LOCAL_REGISTRY_IMAGE}":{} || true
             echo "Old Docker application images cleaned up."
 
             # Save current version for future rollback
