@@ -89,20 +89,21 @@ jobs:
             docker run --rm --entrypoint htpasswd httpd:2 -Bbn "${{ secrets.DOCKER_USERNAME }}" "${{ secrets.DOCKER_PASSWORD }}" > "$REGISTRY_AUTH_DIR/htpasswd" || { echo "Failed to create htpasswd file!"; exit 1; }
             if [ -s "$REGISTRY_AUTH_DIR/htpasswd" ]; then
                 echo "htpasswd file created successfully."
+                cat "$REGISTRY_AUTH_DIR/htpasswd"
             else
                 echo "ERROR: htpasswd file is empty or not created!" >&2
                 exit 1
             fi
 
             # Stop and remove previous registry containers
-            docker compose -f "$REGISTRY_COMPOSE_FILE" down || true
+            docker compose -f "$REGISTRY_COMPOSE_FILE" down --timeout 0 --rmi all --volumes --remove-orphans || true
             echo "Previous registry containers stopped and removed."
 
             # Start registry with retries
             echo "Starting registry..."
-            for attempt in {1..3}; do
+            for attempt in {1..5}; do
               docker compose -f "$REGISTRY_COMPOSE_FILE" up -d
-              sleep 5
+              sleep 10
               if docker ps --filter "ancestor=registry:2" --filter "status=running" | grep -q "registry"; then
                 echo "Registry container is running."
                 break
@@ -111,20 +112,42 @@ jobs:
                 docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true
               fi
               echo "Registry start attempt $attempt failed, retrying..." >&2
-            done || { echo "Registry failed to start after multiple attempts!"; exit 1; }
+            done || { echo "Registry failed to start after multiple attempts!" >&2
+                      echo "Current docker ps -a output:" >&2
+                      docker ps -a >&2
+                      exit 1; }
 
             # Verify registry health with retries
             echo "Verifying registry health..."
-            for attempt in {1..3}; do
+            for attempt in {1..5}; do
               if curl -s -u "${{ secrets.DOCKER_USERNAME }}:${{ secrets.DOCKER_PASSWORD }}" http://localhost:5000/v2/ | grep -q '{}'; then
                 echo "Registry health check passed."
                 break
               else
                 echo "Registry health check failed on attempt $attempt. Checking logs..." >&2
                 docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true
-                sleep 5
+                sleep 10
               fi
             done || { echo "Registry failed health check after multiple attempts!" >&2
+                      echo "Current docker ps -a output:" >&2
+                      docker ps -a >&2
+                      echo "Checking port 5000:" >&2
+                      sudo netstat -tulnp | grep ":5000\b" >&2
+                      sudo lsof -i :5000 >&2
+                      exit 1; }
+
+            # Test registry login
+            echo "Testing Docker login to registry..."
+            for attempt in {1..5}; do
+              if echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.138:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin; then
+                echo "Docker login to registry succeeded."
+                break
+              else
+                echo "Docker login failed on attempt $attempt. Checking registry logs..." >&2
+                docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true
+                sleep 10
+              fi
+            done || { echo "Docker login to registry failed after multiple attempts!" >&2
                       echo "Current docker ps -a output:" >&2
                       docker ps -a >&2
                       exit 1; }
@@ -176,16 +199,8 @@ jobs:
                 echo "App directory or docker-compose.yml not found, skipping docker compose down."
             fi
 
-            # Stop and remove ALL containers using target ports or images
-            echo "Force stopping and removing ALL containers using ports $APP_PORT and 5433 or related images..."
-            docker ps -a -q --filter "ancestor=${LOCAL_REGISTRY_IMAGE}" | xargs -r docker stop || true
-            docker ps -a -q --filter "ancestor=${LOCAL_REGISTRY_IMAGE}" | xargs -r docker rm -f || true
-            docker ps -a -q --filter "ancestor=postgres" | xargs -r docker stop || true
-            docker ps -a -q --filter "ancestor=postgres" | xargs -r docker rm -f || true
-            docker ps -a -q --filter "port=$APP_PORT" | xargs -r docker stop || true
-            docker ps -a -q --filter "port=$APP_PORT" | xargs -r docker rm -f || true
-            docker ps -a -q --filter "port=5433" | xargs -r docker stop || true
-            docker ps -a -q --filter "port=5433" | xargs -r docker rm -f || true
+            # Stop and remove ALL containers
+            echo "Force stopping and removing ALL containers..."
             docker ps -a -q | xargs -r docker stop || true
             docker ps -a -q | xargs -r docker rm -f || true
 
@@ -289,7 +304,21 @@ jobs:
 
             # 7. Login to local registry
             echo "Logging into local registry on VPS for push..."
-            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.138:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin || { echo "Docker login on VPS failed!"; exit 1; }
+            for attempt in {1..5}; do
+              if echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.138:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin; then
+                echo "Docker login to registry succeeded."
+                break
+              else
+                echo "Docker login failed on attempt $attempt. Checking registry status..." >&2
+                docker ps -a --filter "ancestor=registry:2"
+                docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true
+                sudo netstat -tulnp | grep ":5000\b" || true
+                sleep 10
+              fi
+            done || { echo "Docker login to registry failed after multiple attempts!" >&2
+                      echo "Current docker ps -a output:" >&2
+                      docker ps -a >&2
+                      exit 1; }
             echo "Logged into local registry on VPS."
 
             # 8. Build Docker image
