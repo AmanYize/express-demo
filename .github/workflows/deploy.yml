@@ -68,6 +68,7 @@ jobs:
             services:
               registry:
                 image: registry:2
+                container_name: registry-registry-1
                 ports:
                   - "5000:5000"
                 environment:
@@ -104,12 +105,12 @@ jobs:
             for attempt in {1..5}; do
               docker compose -f "$REGISTRY_COMPOSE_FILE" up -d
               sleep 10
-              if docker ps --filter "ancestor=registry:2" --filter "status=running" | grep -q "registry"; then
+              if docker ps --filter "name=registry-registry-1" --filter "status=running" | grep -q "registry-registry-1"; then
                 echo "Registry container is running."
                 break
               else
                 echo "Registry container not running after attempt $attempt. Checking logs..." >&2
-                docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true
+                docker logs registry-registry-1 || true
               fi
               echo "Registry start attempt $attempt failed, retrying..." >&2
             done || { echo "Registry failed to start after multiple attempts!" >&2
@@ -125,7 +126,7 @@ jobs:
                 break
               else
                 echo "Registry health check failed on attempt $attempt. Checking logs..." >&2
-                docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true
+                docker logs registry-registry-1 || true
                 sleep 10
               fi
             done || { echo "Registry failed health check after multiple attempts!" >&2
@@ -144,7 +145,7 @@ jobs:
                 break
               else
                 echo "Docker login failed on attempt $attempt. Checking registry logs..." >&2
-                docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true
+                docker logs registry-registry-1 || true
                 sleep 10
               fi
             done || { echo "Docker login to registry failed after multiple attempts!" >&2
@@ -183,10 +184,26 @@ jobs:
             # 1. Diagnostic: Check initial state
             echo "Checking initial state of containers and ports..."
             docker ps -a
-            sudo netstat -tulnp | grep -E ":($APP_PORT|5433)\b" || true
-            sudo lsof -i :$APP_PORT -i :5433 || true
+            sudo netstat -tulnp | grep -E ":($APP_PORT|5433|5000)\b" || true
+            sudo lsof -i :$APP_PORT -i :5433 -i :5000 || true
 
-            # 2. Aggressive Cleanup
+            # 2. Verify registry is running
+            echo "Verifying registry container..."
+            if ! docker ps --filter "name=registry-registry-1" --filter "status=running" | grep -q "registry-registry-1"; then
+              echo "Registry container not running, attempting to restart..."
+              cd /root/registry
+              docker compose -f docker-compose.yml up -d || { echo "Failed to restart registry!" >&2; exit 1; }
+              sleep 10
+              if ! docker ps --filter "name=registry-registry-1" --filter "status=running" | grep -q "registry-registry-1"; then
+                echo "Registry container failed to start!" >&2
+                docker logs registry-registry-1 >&2
+                docker ps -a >&2
+                exit 1
+              fi
+            fi
+            echo "Registry container is running."
+
+            # 3. Aggressive Cleanup (exclude registry)
             echo "--- Starting Aggressive Application Cleanup ---"
             cd /root
 
@@ -199,17 +216,25 @@ jobs:
                 echo "App directory or docker-compose.yml not found, skipping docker compose down."
             fi
 
-            # Stop and remove ALL containers
-            echo "Force stopping and removing ALL containers..."
-            docker ps -a -q | xargs -r docker stop || true
-            docker ps -a -q | xargs -r docker rm -f || true
+            # Stop and remove containers except registry
+            echo "Force stopping and removing containers except registry..."
+            docker ps -a -q --filter "ancestor=${LOCAL_REGISTRY_IMAGE}" | xargs -r docker stop || true
+            docker ps -a -q --filter "ancestor=${LOCAL_REGISTRY_IMAGE}" | xargs -r docker rm -f || true
+            docker ps -a -q --filter "ancestor=postgres" | xargs -r docker stop || true
+            docker ps -a -q --filter "ancestor=postgres" | xargs -r docker rm -f || true
+            docker ps -a -q --filter "port=$APP_PORT" | xargs -r docker stop || true
+            docker ps -a -q --filter "port=$APP_PORT" | xargs -r docker rm -f || true
+            docker ps -a -q --filter "port=5433" | xargs -r docker stop || true
+            docker ps -a -q --filter "port=5433" | xargs -r docker rm -f || true
+            # Exclude registry container
+            docker ps -a -q --filter "name=^registry-registry-1$" --filter "status=exited" | xargs -r docker rm -f || true
 
-            # Prune all unused Docker resources
-            echo "Pruning all unused Docker system resources..."
+            # Prune unused Docker resources (images, volumes, networks)
+            echo "Pruning unused Docker system resources..."
             sudo docker system prune -a -f --volumes || true
             sudo docker network prune -f || true
 
-            # 3. Advanced Port Cleanup Loop
+            # 4. Advanced Port Cleanup Loop
             echo "--- Starting Advanced Port Cleanup for ports $APP_PORT and 5433 ---"
             PORT_CLEANUP_ATTEMPTS=0
             MAX_PORT_CLEANUP_ATTEMPTS=20
@@ -265,7 +290,7 @@ jobs:
             fi
             echo "--- Advanced Port Cleanup Complete ---"
 
-            # 4. Wait for sockets to clear
+            # 5. Wait for sockets to clear
             echo "Waiting for sockets to clear on ports $APP_PORT and 5433..."
             for i in {1..15}; do
                 if ! sudo netstat -tan | grep -E ":($APP_PORT|5433)\b" > /dev/null; then
@@ -277,7 +302,7 @@ jobs:
                 sleep 5
             done
 
-            # 5. Final verification before deployment
+            # 6. Final verification before deployment
             echo "Final verification: Ensuring ports $APP_PORT and 5433 are free..."
             if sudo netstat -tulnp | grep -E ":($APP_PORT|5433)\b" > /dev/null; then
                 echo "ERROR: Ports $APP_PORT or 5433 are still in use. Aborting deployment." >&2
@@ -291,7 +316,7 @@ jobs:
             fi
             echo "Ports $APP_PORT and 5433 are free. Proceeding with deployment."
 
-            # 6. Update application repository
+            # 7. Update application repository
             echo "Updating application repository on VPS..."
             if [ ! -d "$APP_DIR" ]; then
                 git clone https://github.com/AmanYize/express-demo "$APP_DIR"
@@ -302,7 +327,7 @@ jobs:
             git pull origin master
             echo "Application repository updated on VPS."
 
-            # 7. Login to local registry
+            # 8. Login to local registry
             echo "Logging into local registry on VPS for push..."
             for attempt in {1..5}; do
               if echo "${{ secrets.DOCKER_PASSWORD }}" | docker login 37.27.196.138:5000 -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin; then
@@ -310,9 +335,12 @@ jobs:
                 break
               else
                 echo "Docker login failed on attempt $attempt. Checking registry status..." >&2
-                docker ps -a --filter "ancestor=registry:2"
-                docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true
+                docker ps -a --filter "name=registry-registry-1"
+                docker logs registry-registry-1 || true
                 sudo netstat -tulnp | grep ":5000\b" || true
+                # Attempt to restart registry
+                cd /root/registry
+                docker compose -f docker-compose.yml up -d || true
                 sleep 10
               fi
             done || { echo "Docker login to registry failed after multiple attempts!" >&2
@@ -321,7 +349,7 @@ jobs:
                       exit 1; }
             echo "Logged into local registry on VPS."
 
-            # 8. Build Docker image
+            # 9. Build Docker image
             echo "Building Docker image natively on VPS..."
             docker build \
               --build-arg NODE_VERSION=${{ secrets.NODE_VERSION }} \
@@ -330,25 +358,25 @@ jobs:
               . || { echo "Docker image build on VPS failed!"; exit 1; }
             echo "Docker image built on VPS successfully."
 
-            # 9. Push to local registry
+            # 10. Push to local registry
             echo "Pushing newly built image to local registry from VPS..."
             docker push "${LOCAL_REGISTRY_IMAGE}:${APP_BUILD_TAG}" || { echo "Docker image push to local registry failed!"; exit 1; }
             docker push "${LOCAL_REGISTRY_IMAGE}:latest" || { echo "Docker image latest tag push failed!"; exit 1; }
             echo "Image pushed to local registry."
 
-            # 10. Set environment variables for docker-compose
+            # 11. Set environment variables for docker-compose
             export APP_VERSION=${{ github.sha }}
             export APP_PORT=${{ secrets.APP_PORT }}
             export POSTGRES_VERSION=${{ secrets.POSTGRES_VERSION }}
             export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
 
-            # 11. Configure firewall
+            # 12. Configure firewall
             echo "Configuring firewall for application ports..."
             sudo ufw allow ${APP_PORT}
             sudo ufw allow 5433
             echo "Firewall configured."
 
-            # 12. Deploy with docker-compose
+            # 13. Deploy with docker-compose
             echo "Deploying new application version with docker-compose..."
             for attempt in {1..5}; do
                 cd "$APP_DIR"
@@ -368,7 +396,7 @@ jobs:
                 fi
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d && break
                 echo "Deployment attempt $attempt failed, retrying..." >&2
-                # Aggressive cleanup before retry
+                # Cleanup before retry
                 docker ps -a -q --filter "port=$APP_PORT" | xargs -r docker stop || true
                 docker ps -a -q --filter "port=$APP_PORT" | xargs -r docker rm -f || true
                 docker ps -a -q --filter "port=5433" | xargs -r docker stop || true
@@ -380,7 +408,7 @@ jobs:
                       exit 1; }
             echo "Application deployed successfully."
 
-            # 13. Verify application health
+            # 14. Verify application health
             echo "--- Starting Application Verification ---"
             sleep 15
             if ! curl -s http://localhost:${APP_PORT}/health | grep -q "ok"; then
@@ -401,7 +429,7 @@ jobs:
             fi
             echo "--- Application Verification Successful ---"
 
-            # 14. Post-deployment cleanup
+            # 15. Post-deployment cleanup
             echo "--- Starting Post-Deployment Cleanup ---"
             docker images "${LOCAL_REGISTRY_IMAGE}" --format '{{.Tag}}' | sort -r | tail -n +6 | xargs -r -I {} docker rmi "${LOCAL_REGISTRY_IMAGE}":{} || true
             echo "Old Docker application images cleaned up."
