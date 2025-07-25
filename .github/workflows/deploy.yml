@@ -72,50 +72,62 @@ jobs:
                   - "5000:5000"
                 environment:
                   - REGISTRY_HTTP_ADDR=0.0.0.0:5000
-                  - REGISTRY_HTTP_TLS_ENABLED=false
                   - REGISTRY_AUTH=htpasswd
                   - REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm
                   - REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd
                 volumes:
                   - registry-data:/var/lib/registry
-                  - $REGISTRY_AUTH_DIR Aesops Fables
+                  - $REGISTRY_AUTH_DIR:/auth
                 restart: always
             volumes:
               registry-data:
             EOF
             echo "Registry docker-compose.yml created."
 
-            docker run --entrypoint htpasswd httpd:2 -Bbn "${{ secrets.DOCKER_USERNAME }}" "${{ secrets.DOCKER_PASSWORD }}" > "$REGISTRY_AUTH_DIR/htpasswd"
-            echo "htpasswd file created for registry authentication."
+            # Create htpasswd file and verify
+            echo "Creating htpasswd file..."
+            docker run --rm --entrypoint htpasswd httpd:2 -Bbn "${{ secrets.DOCKER_USERNAME }}" "${{ secrets.DOCKER_PASSWORD }}" > "$REGISTRY_AUTH_DIR/htpasswd" || { echo "Failed to create htpasswd file!"; exit 1; }
+            if [ -s "$REGISTRY_AUTH_DIR/htpasswd" ]; then
+                echo "htpasswd file created successfully."
+            else
+                echo "ERROR: htpasswd file is empty or not created!" >&2
+                exit 1
+            fi
 
+            # Stop and remove previous registry containers
             docker compose -f "$REGISTRY_COMPOSE_FILE" down || true
             echo "Previous registry containers stopped and removed."
 
+            # Start registry with retries
             echo "Starting registry..."
             for attempt in {1..3}; do
               docker compose -f "$REGISTRY_COMPOSE_FILE" up -d
+              sleep 5
               if docker ps --filter "ancestor=registry:2" --filter "status=running" | grep -q "registry"; then
-                echo "Registry container appears to be running."
+                echo "Registry container is running."
                 break
               else
-                echo "Registry container not running after 'up' command. Checking logs for details..." >&2
+                echo "Registry container not running after attempt $attempt. Checking logs..." >&2
                 docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true
               fi
               echo "Registry start attempt $attempt failed, retrying..." >&2
-              sleep 5
             done || { echo "Registry failed to start after multiple attempts!"; exit 1; }
-            echo "Registry started successfully."
 
-            echo "Verifying registry health using localhost:5000 with authentication..."
-            if ! curl -s -u "${{ secrets.DOCKER_USERNAME }}:${{ secrets.DOCKER_PASSWORD }}" http://localhost:5000/v2/ | grep -q '{}'; then
-              echo "Registry failed health check on HTTP at localhost:5000" >&2
-              echo "Current docker ps output:" >&2
-              docker ps -a >&2
-              echo "Current docker logs for registry:" >&2
-              docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) >&2
-              exit 1
-            fi
-            echo "Registry health check passed."
+            # Verify registry health with retries
+            echo "Verifying registry health..."
+            for attempt in {1..3}; do
+              if curl -s -u "${{ secrets.DOCKER_USERNAME }}:${{ secrets.DOCKER_PASSWORD }}" http://localhost:5000/v2/ | grep -q '{}'; then
+                echo "Registry health check passed."
+                break
+              else
+                echo "Registry health check failed on attempt $attempt. Checking logs..." >&2
+                docker logs $(docker ps -a --filter "ancestor=registry:2" -q --latest) || true
+                sleep 5
+              fi
+            done || { echo "Registry failed health check after multiple attempts!" >&2
+                      echo "Current docker ps -a output:" >&2
+                      docker ps -a >&2
+                      exit 1; }
 
             sudo ufw allow 5000
             echo "Firewall configured to allow port 5000."
@@ -154,7 +166,7 @@ jobs:
             echo "--- Starting Aggressive Application Cleanup ---"
             cd /root
 
-            echo "Stopping and removing all containers for project: $PROJECT_NAME..."
+            # Stop and remove all containers for the project
             if [ -d "$APP_DIR" ] && [ -f "$APP_DIR/docker-compose.yml" ]; then
                 cd "$APP_DIR"
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml down --timeout 0 --rmi all --volumes --remove-orphans || true
@@ -163,21 +175,24 @@ jobs:
                 echo "App directory or docker-compose.yml not found, skipping docker compose down."
             fi
 
-            echo "Force stopping and removing any lingering app or postgres containers..."
+            # Stop and remove all containers using target ports or images
+            echo "Force stopping and removing containers using ports $APP_PORT and 5433 or related images..."
             docker ps -a -q --filter "ancestor=${LOCAL_REGISTRY_IMAGE}" | xargs -r docker stop || true
             docker ps -a -q --filter "ancestor=${LOCAL_REGISTRY_IMAGE}" | xargs -r docker rm -f || true
             docker ps -a -q --filter "ancestor=postgres" | xargs -r docker stop || true
             docker ps -a -q --filter "ancestor=postgres" | xargs -r docker rm -f || true
+            docker ps -a -q --filter "port=$APP_PORT" | xargs -r docker stop || true
+            docker ps -a -q --filter "port=$APP_PORT" | xargs -r docker rm -f || true
+            docker ps -a -q --filter "port=5433" | xargs -r docker stop || true
+            docker ps -a -q --filter "port=5433" | xargs -r docker rm -f || true
 
+            # Prune all unused Docker resources
             echo "Pruning all unused Docker system resources..."
             sudo docker system prune -a -f --volumes || true
-
-            echo "Verifying no containers are using ports $APP_PORT and 5433..."
-            docker ps -a --filter "port=$APP_PORT" --filter "port=5433" -q | xargs -r docker stop || true
-            docker ps -a --filter "port=$APP_PORT" --filter "port=5433" -q | xargs -r docker rm -f || true
+            sudo docker network prune -f || true
 
             # 3. Advanced Port Cleanup Loop
-            echo "--- Starting Advanced Port Cleanup and Verification for ports $APP_PORT and 5433 ---"
+            echo "--- Starting Advanced Port Cleanup for ports $APP_PORT and 5433 ---"
             PORT_CLEANUP_ATTEMPTS=0
             MAX_PORT_CLEANUP_ATTEMPTS=20
             PORT_CHECK_INTERVAL=5
@@ -229,7 +244,7 @@ jobs:
             fi
             echo "--- Advanced Port Cleanup Complete ---"
 
-            # 4. Wait for sockets to clear (handle TIME_WAIT or CLOSE_WAIT)
+            # 4. Wait for sockets to clear
             echo "Waiting for sockets to clear on ports $APP_PORT and 5433..."
             for i in {1..10}; do
                 if ! sudo netstat -tan | grep -E ":($APP_PORT|5433)\b" > /dev/null; then
@@ -303,7 +318,7 @@ jobs:
             for attempt in {1..3}; do
                 cd "$APP_DIR"
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml pull || true
-                echo "Waiting 30 seconds before starting containers to ensure port release and system readiness..."
+                echo "Waiting 30 seconds before starting containers to ensure port release..."
                 sleep 30
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d && break
                 echo "Deployment attempt $attempt failed, retrying..." >&2
@@ -322,10 +337,10 @@ jobs:
                 PREV_VERSION=$(cat /root/previous_version.txt || echo "")
                 if [ -n "$PREV_VERSION" ]; then
                     export APP_VERSION="$PREV_VERSION"
-                    echo "Attempting to pull and roll back to ${LOCAL_REGISTRY_IMAGE}:$PREV_VERSION from local registry"
+                    echo "Attempting to roll back to ${LOCAL_REGISTRY_IMAGE}:$PREV_VERSION"
                     cd "$APP_DIR"
-                    docker compose -p "$PROJECT_NAME" -f docker-compose.yml pull || { echo "Failed to pull previous app image for rollback!"; exit 1; }
-                    docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d || { echo "Failed to deploy previous version during rollback!"; exit 1; }
+                    docker compose -p "$PROJECT_NAME" -f docker-compose.yml pull || { echo "Failed to pull previous app image!"; exit 1; }
+                    docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d || { echo "Failed to deploy previous version!"; exit 1; }
                     echo "Rolled back to $PREV_VERSION"
                     exit 1
                 else
