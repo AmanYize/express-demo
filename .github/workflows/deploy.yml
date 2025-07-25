@@ -78,7 +78,7 @@ jobs:
                   - REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd
                 volumes:
                   - registry-data:/var/lib/registry
-                  - $REGISTRY_AUTH_DIR:/auth
+                  - $REGISTRY_AUTH_DIR Aesops Fables
                 restart: always
             volumes:
               registry-data:
@@ -180,7 +180,7 @@ jobs:
             echo "--- Starting Advanced Port Cleanup and Verification for ports $APP_PORT and 5433 ---"
             PORT_CLEANUP_ATTEMPTS=0
             MAX_PORT_CLEANUP_ATTEMPTS=20
-            PORT_CHECK_INTERVAL=3
+            PORT_CHECK_INTERVAL=5
 
             while [ "$PORT_CLEANUP_ATTEMPTS" -lt "$MAX_PORT_CLEANUP_ATTEMPTS" ]; do
                 echo "Attempt $((PORT_CLEANUP_ATTEMPTS + 1)) of $MAX_PORT_CLEANUP_ATTEMPTS: Checking ports $APP_PORT and 5433."
@@ -218,28 +218,42 @@ jobs:
             done
 
             if [ "$PORT_CLEANUP_ATTEMPTS" -eq "$MAX_PORT_CLEANUP_ATTEMPTS" ]; then
-                echo "ERROR: Ports $APP_PORT or 5433 are still in use after $MAX_PORT_CLEANUP_ATTEMPTS attempts. Aborting deployment." >&2
+                echo "ERROR: Ports $APP_PORT or 5433 are still in use after $MAX_PORT_CLEANUP_ATTEMPTS attempts." >&2
+                echo "Current docker ps -a output:" >&2
+                docker ps -a >&2
+                echo "Current docker network ls output:" >&2
+                docker network ls >&2
+                echo "Checking for TIME_WAIT or CLOSE_WAIT sockets:" >&2
+                sudo netstat -tan | grep ":5433\b" >&2
                 exit 1
             fi
-            echo "--- Advanced Port Cleanup Complete. Resuming deployment. ---"
+            echo "--- Advanced Port Cleanup Complete ---"
 
-            # 4. Wait for sockets to clear
+            # 4. Wait for sockets to clear (handle TIME_WAIT or CLOSE_WAIT)
             echo "Waiting for sockets to clear on ports $APP_PORT and 5433..."
             for i in {1..10}; do
-                if ! sudo netstat -tulnp | grep -E ":($APP_PORT|5433)\b" > /dev/null; then
+                if ! sudo netstat -tan | grep -E ":($APP_PORT|5433)\b" > /dev/null; then
                     echo "Sockets cleared."
                     break
                 fi
-                echo "Sockets still in use, waiting... ($i/10)"
+                echo "Sockets still in use (attempt $i/10):"
+                sudo netstat -tan | grep -E ":($APP_PORT|5433)\b"
                 sleep 5
             done
 
-            # 5. Verify ports are free before deployment
-            echo "Verifying ports $APP_PORT and 5433 are free before deployment..."
+            # 5. Final verification before deployment
+            echo "Final verification: Ensuring ports $APP_PORT and 5433 are free..."
             if sudo netstat -tulnp | grep -E ":($APP_PORT|5433)\b" > /dev/null; then
                 echo "ERROR: Ports $APP_PORT or 5433 are still in use. Aborting deployment." >&2
+                echo "Processes from ss:" >&2
+                sudo ss -tulpn | grep -E ":($APP_PORT|5433)\b" || true >&2
+                echo "Processes from lsof:" >&2
+                sudo lsof -i :$APP_PORT -i :5433 || true >&2
+                echo "Current docker ps -a output:" >&2
+                docker ps -a >&2
                 exit 1
             fi
+            echo "Ports $APP_PORT and 5433 are free. Proceeding with deployment."
 
             # 6. Update application repository
             echo "Updating application repository on VPS..."
@@ -290,11 +304,14 @@ jobs:
                 cd "$APP_DIR"
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml pull || true
                 echo "Waiting 30 seconds before starting containers to ensure port release and system readiness..."
-                sleep 30 
+                sleep 30
                 docker compose -p "$PROJECT_NAME" -f docker-compose.yml up -d && break
                 echo "Deployment attempt $attempt failed, retrying..." >&2
                 sleep 15
-            done || { echo "Application deployment failed after multiple attempts!"; exit 1; }
+            done || { echo "Application deployment failed after multiple attempts!" >&2
+                      echo "Current docker ps -a output:" >&2
+                      docker ps -a >&2
+                      exit 1; }
             echo "Application deployed successfully."
 
             # 13. Verify application health
