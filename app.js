@@ -45,6 +45,19 @@ app.get('/hello', async (req, res) => {
   }
 });
 
+app.get('/calling', async (req, res) => {
+  try {
+    await pool.query('CREATE TABLE IF NOT EXISTS visits (id SERIAL PRIMARY KEY, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)');
+    await pool.query('INSERT INTO visits (timestamp) VALUES (CURRENT_TIMESTAMP)');
+    const result = await pool.query('SELECT COUNT(*) FROM visits');
+    res.json({ message: 'Hello, Calling!', visitCount: result.rows[0].count });
+  } catch (err) {
+   
+    res.status(500).json({ error: 'Database error', message: err.message, full_error: err });
+  }
+});
+
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
