@@ -57,6 +57,10 @@ app.get('/calling', async (req, res) => {
   }
 });
 
+app.get('/ping', (req, res) => {
+  res.json({ status: 'pong' });
+});
+
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
